@@ -1,3 +1,5 @@
+Notice: This project is an active experimental sandbox. Due to rapid iterations and heavy architectural experimentation, code was developed with the assistance of AI collaborators.
+
 # Field Engine: MoE model compression without storing expert weights
 
 An expert is not stored - it is **assembled on the fly** as a matrix field:
