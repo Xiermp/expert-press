@@ -1,0 +1,20 @@
+{
+  "stages": {
+    "bootstrap": {
+      "seconds": 1.4,
+      "corpus_ok": true,
+      "ckpt_ok": true
+    },
+    "transform": {
+      "seconds": 32.2,
+      "ranks": "8",
+      "fit_steps": 120
+    },
+    "verify": {
+      "seconds": 6.8
+    }
+  },
+  "started": "2026-08-31 18:49:31",
+  "total_seconds": 40.4,
+  "finished": "2026-08-31 18:50:12"
+}

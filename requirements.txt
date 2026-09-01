@@ -1,0 +1,15 @@
+# Core (installed automatically at first run if missing)
+torch>=2.2
+transformers>=5.0
+huggingface_hub>=0.30
+safetensors>=0.5
+accelerate>=1.0
+gguf>=0.10          # GGUF dequant (Q4_K_M etc.)
+numpy>=1.26
+tokenizers>=0.20
+
+# Optional: calibrate/eval on wikitext (--calib-dataset)
+# datasets>=2.19
+
+# Optional: charts in the toy pipeline
+# matplotlib

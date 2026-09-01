@@ -1,0 +1,56 @@
+{
+  "created": "2026-08-31 18:50:11",
+  "base_ppl": 8.122262537026508,
+  "base_ce": 2.0946087529261908,
+  "artifacts": [
+    {
+      "rank": 16,
+      "artifact": "moe_transformed_field_r16.pt",
+      "claimed_mb": 0.477184,
+      "actual_mb": 0.477184,
+      "file_mb": 1.604544,
+      "backbone_mb": 1.12736,
+      "full_mb": 3.145728,
+      "ratio": 6.592274678111588,
+      "kl_bits": 0.03606809065716493,
+      "ppl": 8.357565504078952,
+      "ppl_delta": 2.8970125747571154,
+      "csv_kl": null,
+      "csv_ppl_delta": null,
+      "gen_match": 35.9375
+    },
+    {
+      "rank": 32,
+      "artifact": "moe_transformed_field_r32.pt",
+      "claimed_mb": 0.561152,
+      "actual_mb": 0.561152,
+      "file_mb": 1.688512,
+      "backbone_mb": 1.12736,
+      "full_mb": 3.145728,
+      "ratio": 5.605839416058394,
+      "kl_bits": 0.028627306793722128,
+      "ppl": 8.322143512425294,
+      "ppl_delta": 2.460902667053665,
+      "csv_kl": null,
+      "csv_ppl_delta": null,
+      "gen_match": 31.25
+    },
+    {
+      "rank": 8,
+      "artifact": "moe_transformed_field_r8.pt",
+      "claimed_mb": 0.4352,
+      "actual_mb": 0.4352,
+      "file_mb": 1.562491,
+      "backbone_mb": 1.127291,
+      "full_mb": 3.145728,
+      "ratio": 7.228235294117647,
+      "kl_bits": 0.18234061293735107,
+      "ppl": 9.248877390901294,
+      "ppl_delta": 13.870702267243262,
+      "csv_kl": 0.18234456231290727,
+      "csv_ppl_delta": 13.870976358252227,
+      "gen_match": 37.5
+    }
+  ],
+  "generation_base": " wind of the north,\nTo do me bust the the the the there ton there to ther tour ther to ther to the the the the the the the the there ther tour t there to ther the to the the the the the the se"
+}
