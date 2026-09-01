@@ -32,7 +32,9 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
+import types
 
 import hf_env  # noqa: F401  - HF cache inside the project; before transformers/hub
 import numpy as np
@@ -576,6 +578,28 @@ def self_check(cfg, sd_shapes):
 
 # ------------------------------------------------------------------ GGUF source
 
+# Process-wide cache of RAW (packed) GGUF tensor bytes, shared by every
+# GgufHfSource instance created in this process (stream runner, refit runner,
+# artifact writer...). Key: (gguf abspath, tensor name) -> np.ndarray copy.
+# Effect: after the first pass over the layers every subsequent block load is
+# served from RAM - no repeated disk reads on the calibration/refit passes.
+# RAM cost: ~= the size of the packed GGUF (Q4/Q8), lazily, tensor by tensor.
+_RAW_CACHE = {}
+_RAW_CACHE_LOCK = threading.Lock()
+_RAW_CACHE_HITS = [0]
+
+
+def raw_cache_stats():
+    """(n_tensors, bytes) currently held in the process-wide raw cache."""
+    with _RAW_CACHE_LOCK:
+        return len(_RAW_CACHE), sum(t.nbytes for t in _RAW_CACHE.values())
+
+
+def raw_cache_clear():
+    with _RAW_CACHE_LOCK:
+        _RAW_CACHE.clear()
+
+
 class GgufHfSource:
     """GGUF as a weight source with HF names: ON-THE-FLY dequant, no checkpoint.
 
@@ -587,9 +611,10 @@ class GgufHfSource:
     dequant).
     """
 
-    def __init__(self, gguf_path, dtype="float16", io_workers=1):
+    def __init__(self, gguf_path, dtype="float16", io_workers=1, cache_ram=False):
         self.gguf_path = os.path.abspath(gguf_path)
         self.io_workers = max(1, int(io_workers))
+        self.cache_ram = bool(cache_ram)   # keep raw packed tensors in RAM
         self.rd = GGUFReader(self.gguf_path, mode="r")
         self.meta = read_meta(self.rd)
         self.g = geom_from_meta(self.meta)
@@ -615,9 +640,29 @@ class GgufHfSource:
     def __contains__(self, hf):
         return hf in self.hf2gguf
 
+    def _rt(self, name):
+        """ReaderTensor for `name`; with cache_ram=True the packed bytes are
+        copied into RAM on first touch and served from the process-wide cache
+        afterwards (thread-safe: the prefetch worker calls this too)."""
+        rt = self.by[name]
+        if not self.cache_ram:
+            return rt
+        key = (self.gguf_path, name)
+        with _RAW_CACHE_LOCK:
+            buf = _RAW_CACHE.get(key)
+            if buf is None:
+                buf = np.array(rt.data)       # copy: memmap slice -> RAM
+                _RAW_CACHE[key] = buf
+            else:
+                _RAW_CACHE_HITS[0] += 1
+        if buf is rt.data:
+            return rt
+        return types.SimpleNamespace(data=buf, tensor_type=rt.tensor_type,
+                                     shape=rt.shape)
+
     def _convert(self, name, expected):
         """GGUF tensor -> numpy in HF layout and the output dtype."""
-        arr = convert_tensor(self.by[name], self.g, self.np_dtype,
+        arr = convert_tensor(self._rt(name), self.g, self.np_dtype,
                              workers=self.io_workers)  # fp32
         arr = fit_layout(arr, expected)
         return np.ascontiguousarray(arr.astype(self.np_dtype))
@@ -640,6 +685,12 @@ class GgufHfSource:
         if name.endswith("ffn_gate_exps.weight"):
             n += int(self.by[name.replace("ffn_gate_exps", "ffn_up_exps")].data.nbytes)
         return n
+
+    def cache_stats(self):
+        """(n_tensors, GB, hits) of raw GGUF bytes held in the process-wide
+        RAM cache (shared by every GgufHfSource in this process)."""
+        n, b = raw_cache_stats()
+        return n, b / 1e9, _RAW_CACHE_HITS[0]
 
 
 def has_full_weights(d):

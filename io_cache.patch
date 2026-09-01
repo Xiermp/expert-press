@@ -1,0 +1,477 @@
+From 643ea3309d2df951dabba32bdd26384223d9eacf Mon Sep 17 00:00:00 2001
+From: Super Z <dev@local>
+Date: Tue, 1 Sep 2026 14:44:09 +0000
+Subject: [PATCH] Add --io-cache ram: process-wide raw-GGUF tensor cache for
+ slow storage
+
+On Colab/Drive/HDD the streaming passes re-read the packed expert tensors
+from disk on every pass (pool collection, refit, artifact write). Now the
+raw packed tensors are copied to RAM on first touch (lazily, tensor by
+tensor, ~= packed file size) and served from a process-wide cache afterwards.
+
+- hf_gguf_to_hf.py: GgufHfSource(cache_ram=...), shared _RAW_CACHE, stats
+- hf_stream.py: BlockStreamRunner(io_cache=...), block-load time accounting,
+  io-cache summary in close()
+- hf_pipeline.py: --io-cache {disk,ram}, wired into both runners + profile
+- hf_field_transform.py: write_field_artifact(io_cache=...)
+- test_io_cache.py / test_io_cache_stream.py: bit-exactness + cache-hit tests
+- README.md: Speed knobs section + Colab note
+
+Verified on mini-OLMoE GGUF: logits bit-identical disk vs ram, second
+instance fully served from RAM.
+---
+ README.md               | 19 ++++++++++--
+ hf_field_transform.py   |  5 +--
+ hf_gguf_to_hf.py        | 55 +++++++++++++++++++++++++++++++--
+ hf_pipeline.py          | 19 +++++++++---
+ hf_stream.py            | 27 +++++++++++++---
+ test_io_cache.py        | 62 +++++++++++++++++++++++++++++++++++++
+ test_io_cache_stream.py | 68 +++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 241 insertions(+), 14 deletions(-)
+ create mode 100644 test_io_cache.py
+ create mode 100644 test_io_cache_stream.py
+
+diff --git a/README.md b/README.md
+index 4b1ce05..c0b2298 100644
+--- a/README.md
++++ b/README.md
+@@ -273,9 +273,24 @@ Implemented optimizations:
+ - `--prefetch 1` (default) - a background thread dequantizes the NEXT expert
+   block while the current layer computes. `--prefetch 0` - synchronous
+   (+~1 block of RAM saved).
++- `--io-cache ram` (default `disk`) - copies the RAW PACKED GGUF tensors into
++  RAM on first touch (lazily, tensor by tensor; total ~= the packed file
++  size, e.g. ~2.7 GB for a 1B Q8_0 MoE). The cache is process-wide and shared
++  by every streaming pass, so the calibration-pool collection, a refit pass
++  and the artifact write each read the experts from disk only ONCE - after
++  that all block loads are served from RAM. This is the main lever for slow
++  storage (Google Colab disks, Google Drive mounts, HDDs): one sequential
++  file read replaces thousands of small random ones. On a machine where RAM
++  is too tight even for the packed file, stay on `disk` (prefetch +
++  io-threads still help).
+ - The pool cache makes re-runs (new rank, new fit settings) skip stages 1-4
+   entirely.
+ 
++Colab note: put the GGUF on the LOCAL disk (`/content`), not a Drive mount -
++a Drive FUSE mount turns every small read into a network round-trip. Then
++`--io-cache ram --io-threads 2-4` on a standard Colab VM (12.7 GB RAM) fits
++comfortably: packed GGUF (in cache) + backbone + one expert block.
++
+ Rough per-step cost on a NanoColibri-sized block (d=1024, r=64, bs 4096,
+ 2 CPU cores): ~0.30 s/step after folding (was ~0.51 s) -> a 23-block fit at
+ 300 steps ~0.6 h single-worker; `--fit-workers 2` halves it again.
+@@ -420,14 +435,14 @@ see `modeling_field.py`).
+ |---|---|
+ | `hf_pipeline.py` | the WHOLE compression pipeline in one command (GGUF -> field r=32 -> verify); phased for memory |
+ | `hf_gguf_to_hf.py` | Q4 GGUF download + dequant into a plain HF checkpoint (olmoe, hy_v3) |
+-| `hf_stream.py` | streaming runner: backbone in RAM, experts per block, background prefetch |
++| `hf_stream.py` | streaming runner: backbone in RAM, experts per block, background prefetch, optional raw-GGUF RAM cache (`--io-cache ram`) |
+ | `hf_field_transform.py` | the core: calibration (disk cache), field fit (several methods), deploy, metrics |
+ | `hf_chat.py` | chat with the transformed model in a terminal (streaming output, commands) |
+ | `hf_env.py` | redirects the HF cache into the project (imported first) |
+ | `modeling_field_template.py` | the template of the artifact's modeling code |
+ | `step1_compress.bat` / `step2_chat.bat` | double-click launchers on Windows |
+ | `make_tiny_olmoe_gguf.py` / `make_tiny_hyv3_gguf.py` | mini-GGUF generators (environment check without a 4 GB download) |
+-| `test_stream_mode.py`, `test_gguf_direct.py`, `test_field_fit_guard.py` | A/B tests (bit-exact streaming vs full model; GGUF vs checkpoint; fit guard) |
++| `test_stream_mode.py`, `test_gguf_direct.py`, `test_field_fit_guard.py`, `test_io_cache.py`, `test_io_cache_stream.py` | A/B tests (bit-exact streaming vs full model; GGUF vs checkpoint; fit guard; `--io-cache ram` correctness) |
+ | `run_pipeline.sh` + `pipeline.py`, `common.py`, `train.py`, `transform_eval.py`, `variants_eval.py`, `upgrade_eval.py`, `bank_eval.py`, `masks_eval.py`, `field_eval.py`, `deploy.py`, `verify_transformed.py` | toy pipeline: trains a mini-MoE, compresses it, compares against baselines (SVD/PQ/BitDelta/dense) |
+ | `examples/toy_report/` | mini-PoC reports and numbers |
+ 
+diff --git a/hf_field_transform.py b/hf_field_transform.py
+index 32d2ba2..0e16594 100644
+--- a/hf_field_transform.py
++++ b/hf_field_transform.py
+@@ -762,7 +762,7 @@ def save_field_model(model, tokenizer, out_dir, rank, accounting, meta):
+ 
+ def write_field_artifact(src, out_dir, pool_dir, fit_dir, rank, dtype,
+                          max_shard_bytes=2_000_000_000, gguf=None, profile=None,
+-                         io_workers=1):
++                         io_workers=1, io_cache="disk"):
+     """Assemble the artifact (a plain HF model with the field) WITHOUT loading
+     the model into RAM.
+ 
+@@ -824,7 +824,8 @@ def write_field_artifact(src, out_dir, pool_dir, fit_dir, rank, dtype,
+     gs = None
+     if gguf is not None:                      # backbone straight from the GGUF
+         from hf_gguf_to_hf import GgufHfSource
+-        gs = GgufHfSource(gguf, io_workers=io_workers)
++        gs = GgufHfSource(gguf, io_workers=io_workers,
++                          cache_ram=(io_cache == "ram"))
+     elif not src_files:
+         raise RuntimeError(f"no safetensors files in {src}")
+     for fn in src_files:
+diff --git a/hf_gguf_to_hf.py b/hf_gguf_to_hf.py
+index 9d5e82c..06d57a2 100644
+--- a/hf_gguf_to_hf.py
++++ b/hf_gguf_to_hf.py
+@@ -32,7 +32,9 @@ import json
+ import os
+ import shutil
+ import sys
++import threading
+ import time
++import types
+ 
+ import hf_env  # noqa: F401  - HF cache inside the project; before transformers/hub
+ import numpy as np
+@@ -576,6 +578,28 @@ def self_check(cfg, sd_shapes):
+ 
+ # ------------------------------------------------------------------ GGUF source
+ 
++# Process-wide cache of RAW (packed) GGUF tensor bytes, shared by every
++# GgufHfSource instance created in this process (stream runner, refit runner,
++# artifact writer...). Key: (gguf abspath, tensor name) -> np.ndarray copy.
++# Effect: after the first pass over the layers every subsequent block load is
++# served from RAM - no repeated disk reads on the calibration/refit passes.
++# RAM cost: ~= the size of the packed GGUF (Q4/Q8), lazily, tensor by tensor.
++_RAW_CACHE = {}
++_RAW_CACHE_LOCK = threading.Lock()
++_RAW_CACHE_HITS = [0]
++
++
++def raw_cache_stats():
++    """(n_tensors, bytes) currently held in the process-wide raw cache."""
++    with _RAW_CACHE_LOCK:
++        return len(_RAW_CACHE), sum(t.nbytes for t in _RAW_CACHE.values())
++
++
++def raw_cache_clear():
++    with _RAW_CACHE_LOCK:
++        _RAW_CACHE.clear()
++
++
+ class GgufHfSource:
+     """GGUF as a weight source with HF names: ON-THE-FLY dequant, no checkpoint.
+ 
+@@ -587,9 +611,10 @@ class GgufHfSource:
+     dequant).
+     """
+ 
+-    def __init__(self, gguf_path, dtype="float16", io_workers=1):
++    def __init__(self, gguf_path, dtype="float16", io_workers=1, cache_ram=False):
+         self.gguf_path = os.path.abspath(gguf_path)
+         self.io_workers = max(1, int(io_workers))
++        self.cache_ram = bool(cache_ram)   # keep raw packed tensors in RAM
+         self.rd = GGUFReader(self.gguf_path, mode="r")
+         self.meta = read_meta(self.rd)
+         self.g = geom_from_meta(self.meta)
+@@ -615,9 +640,29 @@ class GgufHfSource:
+     def __contains__(self, hf):
+         return hf in self.hf2gguf
+ 
++    def _rt(self, name):
++        """ReaderTensor for `name`; with cache_ram=True the packed bytes are
++        copied into RAM on first touch and served from the process-wide cache
++        afterwards (thread-safe: the prefetch worker calls this too)."""
++        rt = self.by[name]
++        if not self.cache_ram:
++            return rt
++        key = (self.gguf_path, name)
++        with _RAW_CACHE_LOCK:
++            buf = _RAW_CACHE.get(key)
++            if buf is None:
++                buf = np.array(rt.data)       # copy: memmap slice -> RAM
++                _RAW_CACHE[key] = buf
++            else:
++                _RAW_CACHE_HITS[0] += 1
++        if buf is rt.data:
++            return rt
++        return types.SimpleNamespace(data=buf, tensor_type=rt.tensor_type,
++                                     shape=rt.shape)
++
+     def _convert(self, name, expected):
+         """GGUF tensor -> numpy in HF layout and the output dtype."""
+-        arr = convert_tensor(self.by[name], self.g, self.np_dtype,
++        arr = convert_tensor(self._rt(name), self.g, self.np_dtype,
+                              workers=self.io_workers)  # fp32
+         arr = fit_layout(arr, expected)
+         return np.ascontiguousarray(arr.astype(self.np_dtype))
+@@ -641,6 +686,12 @@ class GgufHfSource:
+             n += int(self.by[name.replace("ffn_gate_exps", "ffn_up_exps")].data.nbytes)
+         return n
+ 
++    def cache_stats(self):
++        """(n_tensors, GB, hits) of raw GGUF bytes held in the process-wide
++        RAM cache (shared by every GgufHfSource in this process)."""
++        n, b = raw_cache_stats()
++        return n, b / 1e9, _RAW_CACHE_HITS[0]
++
+ 
+ def has_full_weights(d):
+     """Does the folder hold a full dequant checkpoint (safetensors)?"""
+diff --git a/hf_pipeline.py b/hf_pipeline.py
+index f687f77..a951153 100644
+--- a/hf_pipeline.py
++++ b/hf_pipeline.py
+@@ -53,6 +53,9 @@ Fit tuning:
+   --fit-workers 2                              # parallel fit of independent blocks
+   --prefetch 0                                 # disable background block prefetch
+                                                # (saves ~1 block of RAM)
++  --io-cache ram                               # keep packed GGUF tensors in RAM
++                                               # (first pass fills the cache,
++                                               # later passes read no disk)
+ 
+ Windows: the same commands via double click - step1_compress.bat / step2_chat.bat.
+ """
+@@ -381,6 +384,11 @@ def main():
+                     help="background prefetch of the next expert block while the "
+                          "current layer computes (default 1; 0 = off, saves ~1 "
+                          "block of RAM)")
++    ap.add_argument("--io-cache", choices=["disk", "ram"], default="disk",
++                    help="ram: copy the packed GGUF tensors into RAM on first "
++                         "touch (~= packed file size); later passes (pool "
++                         "collection, refit, artifact write) read nothing from "
++                         "disk - big win on Colab/Drive or HDD")
+     ap.add_argument("--eval-chunks", type=int, default=50)
+     ap.add_argument("--kl-chunks", type=int, default=16)
+     ap.add_argument("--eval-ctx", type=int, default=512)
+@@ -622,7 +630,8 @@ def main():
+             try:
+                 model = BlockStreamRunner(src, dtype=dtype, device=device,
+                                           gguf=light_gguf, prefetch=args.prefetch,
+-                                          io_workers=args.io_threads)
++                                          io_workers=args.io_threads,
++                                          io_cache=args.io_cache)
+                 stream = model
+             except Exception as e:  # noqa: BLE001
+                 if light_gguf:
+@@ -859,7 +868,8 @@ def main():
+                     runner2 = BlockStreamRunner(src, dtype=dtype, device=device,
+                                                 gguf=light_gguf,
+                                                 prefetch=args.prefetch,
+-                                                io_workers=args.io_threads)
++                                                io_workers=args.io_threads,
++                                                io_cache=args.io_cache)
+                     blocks2 = find_moe_blocks(runner2)
+                     stores = [[] for _ in range(n_blocks)]   # per-block list of (X,Y) chunk files
+ 
+@@ -993,10 +1003,11 @@ def main():
+                    fit_jitter=args.fit_jitter, fit_early_stop=args.fit_early_stop,
+                    fit_preset=fit_preset or "none", fit_workers=args.fit_workers,
+                    io_threads=args.io_threads,
+-                   prefetch=args.prefetch, per_layer_cap=args.per_layer_cap)
++                   prefetch=args.prefetch, io_cache=args.io_cache,
++                   per_layer_cap=args.per_layer_cap)
+     write_field_artifact(src, out_dir, pool_dir, fit_dir, args.rank, dtype,
+                          gguf=light_gguf, profile=profile,
+-                         io_workers=args.io_threads)
++                         io_workers=args.io_threads, io_cache=args.io_cache)
+     full_b, field_b = field_accounting(geoms, args.rank)
+     T.update(rank=args.rank, full_experts_mb=full_b / 1e6, field_mb=field_b / 1e6,
+              ratio=full_b / max(field_b, 1), fit_mses=fit_mses,
+diff --git a/hf_stream.py b/hf_stream.py
+index 436a47c..bde3cd1 100644
+--- a/hf_stream.py
++++ b/hf_stream.py
+@@ -53,13 +53,14 @@ class BlockStreamRunner:
+     """
+ 
+     def __init__(self, src, dtype=torch.bfloat16, device="cpu", progress=True,
+-                 gguf=None, prefetch=1, io_workers=1):
++                 gguf=None, prefetch=1, io_workers=1, io_cache="disk"):
+         from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
+ 
+         self.src, self.dtype = src, dtype
+         self.device = torch.device(device)
+         self.progress = bool(progress)
+         self._io_workers = max(1, int(io_workers))   # GGUF dequant threads
++        self._io_cache = str(io_cache)               # disk | ram (packed cache)
+         self._gguf = self._open_gguf(gguf)   # weight source: None -> safetensors
+         cfg = AutoConfig.from_pretrained(src)
+         with torch.device("meta"):
+@@ -76,6 +77,7 @@ class BlockStreamRunner:
+         self._hooks = []
+         self._stream_n = 0
+         self._stream_bytes = 0
++        self._load_time = 0.0
+         self._slow_hint = False
+         self._expert_keys = {}
+         self._moe_prefixes = []
+@@ -126,7 +128,12 @@ class BlockStreamRunner:
+         if not gguf:
+             return None
+         from hf_gguf_to_hf import GgufHfSource
+-        return GgufHfSource(gguf, io_workers=self._io_workers)
++        if self._io_cache == "ram":
++            print(f"streaming: io-cache ram - raw GGUF tensors are copied to "
++                  f"RAM on first touch (~= the packed file size, ~2.7 GB for a "
++                  f"1B Q8 MoE); later passes read nothing from disk", flush=True)
++        return GgufHfSource(gguf, io_workers=self._io_workers,
++                            cache_ram=(self._io_cache == "ram"))
+ 
+     @staticmethod
+     def _module_names(model):
+@@ -430,6 +437,7 @@ class BlockStreamRunner:
+         self._stream_n += 1
+         self._stream_bytes += nb
+         dt = time.time() - t0
++        self._load_time += dt
+         if self.progress:
+             print(f"\r    ... experts from disk: {self._stream_n} block loads, "
+                   f"{self._stream_bytes / 1e9:.0f} GB read (block {dt:.1f} s)",
+@@ -485,7 +493,18 @@ class BlockStreamRunner:
+         for f in self._handles.values():
+             del f
+         self._handles = {}
+-        self._gguf = None            # release the GGUF mmap
+         if self.progress:
++            avg = self._load_time / self._stream_n if self._stream_n else 0.0
+             print(f"\n    streaming finished: {self._stream_n} block loads, "
+-                  f"{self._stream_bytes / 1e9:.1f} GB read from disk", flush=True)
++                  f"{self._stream_bytes / 1e9:.1f} GB read from disk, "
++                  f"block-load time {self._load_time:.0f} s "
++                  f"(avg {avg:.2f} s/block)", flush=True)
++        if self._gguf is not None:
++            try:
++                n, gb, hits = self._gguf.cache_stats()
++                if n:
++                    print(f"    io-cache ram: {n} tensors ({gb:.2f} GB) held in "
++                          f"RAM, {hits} served-from-RAM hits", flush=True)
++            except AttributeError:
++                pass
++        self._gguf = None            # release the GGUF mmap
+diff --git a/test_io_cache.py b/test_io_cache.py
+new file mode 100644
+index 0000000..25e8d85
+--- /dev/null
++++ b/test_io_cache.py
+@@ -0,0 +1,62 @@
++"""Smoke test for --io-cache ram: GgufHfSource with cache_ram=True.
++
++Checks:
++  1. tensors fetched with cache_ram=True are bit-identical to cache_ram=False;
++  2. the second fetch of the same tensor is served from the process-wide RAM
++     cache (hit counter grows) and still bit-identical;
++  3. two separate GgufHfSource instances share the cache (hits are counted
++     across instances) - this is what saves the refit/artifact passes;
++  4. cache_stats() reports non-zero GB.
++Run: python3 test_io_cache.py [path/to/model.gguf]
++"""
++import os
++import sys
++import numpy as np
++
++import hf_env  # noqa: F401
++
++from hf_gguf_to_hf import GgufHfSource, raw_cache_stats, raw_cache_clear
++
++GGUF = sys.argv[1] if len(sys.argv) > 1 else "tiny.gguf"
++if not os.path.isfile(GGUF):
++    sys.exit(f"no GGUF: {GGUF} - pass a path or generate one via "
++             f"make_tiny_olmoe_gguf.py")
++
++raw_cache_clear()
++
++# ---- disk mode (reference) -------------------------------------------------
++src_disk = GgufHfSource(GGUF, io_workers=1, cache_ram=False)
++keys = src_disk.keys()
++probe = [k for k in keys if ".experts." in k][:2] + \
++        [k for k in keys if ".experts." not in k][:2]
++ref = {}
++for hf in probe:
++    t = src_disk.get(hf)
++    ref[hf] = t.numpy().copy()
++    print(f"  disk  get {hf}: {tuple(t.shape)} {t.dtype}")
++src_disk = None
++
++# ---- ram mode, first instance ----------------------------------------------
++src_ram = GgufHfSource(GGUF, io_workers=1, cache_ram=True)
++for hf in probe:
++    t1 = src_ram.get(hf)                      # fills the cache (miss)
++    t2 = src_ram.get(hf)                      # served from RAM (hit)
++    assert np.array_equal(t1.numpy(), ref[hf]), f"mismatch (miss): {hf}"
++    assert np.array_equal(t2.numpy(), ref[hf]), f"mismatch (hit): {hf}"
++    print(f"  ram   get {hf}: identical to disk (miss+hit)")
++n, gb, hits = src_ram.cache_stats()
++print(f"  cache after inst#1: {n} tensors, {gb:.3f} GB, {hits} hits")
++assert n > 0 and gb > 0, "cache did not fill"
++assert hits >= len(probe), f"expected >= {len(probe)} hits, got {hits}"
++
++# ---- ram mode, second instance (the refit/artifact-writer scenario) --------
++src_ram2 = GgufHfSource(GGUF, io_workers=1, cache_ram=True)
++before = src_ram2.cache_stats()[2]
++for hf in probe:
++    t = src_ram2.get(hf)
++    assert np.array_equal(t.numpy(), ref[hf]), f"mismatch (inst#2): {hf}"
++after = src_ram2.cache_stats()[2]
++print(f"  inst#2 hits: {after - before} (all served from RAM, no disk)")
++assert after - before >= len(probe), "second instance did not hit the cache"
++
++print("IO-CACHE SMOKE OK")
+diff --git a/test_io_cache_stream.py b/test_io_cache_stream.py
+new file mode 100644
+index 0000000..cc5dbcc
+--- /dev/null
++++ b/test_io_cache_stream.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++"""Integration test: BlockStreamRunner(io_cache="ram") on mini-OLMoE.
++
++Pass 1 over the layers fills the process-wide raw-GGUF cache; pass 2 must be
++served from RAM (hits grow, block loads get faster on slow storage). Logits of
++both passes must be identical to the disk-mode runner (bit-exact).
++Run: python3 test_io_cache_stream.py
++"""
++import os
++import sys
++import time
++
++import torch
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import hf_env  # noqa: F401
++from hf_stream import BlockStreamRunner
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++SRC = os.path.join(HERE, "results", "gguf_hf", "tiny-hf")
++GGUF = os.path.join(HERE, "tiny.gguf")
++DTYPE = torch.bfloat16
++
++
++def run_passes(io_cache, n_passes=2):
++    from transformers import AutoTokenizer
++    torch.manual_seed(0)
++    tok = AutoTokenizer.from_pretrained(SRC)
++    ids = torch.tensor(tok("hello world this is a streaming test " * 6)
++                       ["input_ids"][:64]).unsqueeze(0)
++    r = BlockStreamRunner(SRC, dtype=DTYPE, device="cpu", gguf=GGUF,
++                          prefetch=0, io_workers=1, io_cache=io_cache)
++    outs, times = [], []
++    for _ in range(n_passes):
++        t0 = time.time()
++        with torch.no_grad():
++            outs.append(r(input_ids=ids).logits.clone())
++        times.append(time.time() - t0)
++    stats = dict(n=r._stream_n, gb=r._stream_bytes / 1e9,
++                 t=r._load_time, hits=(r._gguf.cache_stats()[2]
++                                       if r._gguf else 0))
++    r.close()
++    return outs, times, stats
++
++
++def main():
++    if not os.path.isfile(GGUF):
++        sys.exit("tiny.gguf not found - generate it first: "
++                 "python3 make_tiny_olmoe_gguf.py")
++    print("== disk mode (reference)")
++    out_d, t_d, st_d = run_passes("disk")
++    print(f"   passes: {[f'{t:.2f}s' for t in t_d]} | "
++          f"block loads {st_d['n']}, {st_d['gb']:.3f} GB")
++
++    print("== ram mode")
++    out_r, t_r, st_r = run_passes("ram")
++    print(f"   passes: {[f'{t:.2f}s' for t in t_r]} | "
++          f"block loads {st_r['n']}, {st_r['gb']:.3f} GB | "
++          f"cache hits {st_r['hits']}")
++
++    for i, (a, b) in enumerate(zip(out_d, out_r)):
++        assert torch.equal(a, b), f"logits mismatch on pass {i}"
++    assert st_r["hits"] > 0, "ram cache recorded no hits"
++    print("IO-CACHE STREAM OK (logits bit-identical, cache hits recorded)")
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.47.3
+

@@ -273,8 +273,23 @@ Implemented optimizations:
 - `--prefetch 1` (default) - a background thread dequantizes the NEXT expert
   block while the current layer computes. `--prefetch 0` - synchronous
   (+~1 block of RAM saved).
+- `--io-cache ram` (default `disk`) - copies the RAW PACKED GGUF tensors into
+  RAM on first touch (lazily, tensor by tensor; total ~= the packed file
+  size, e.g. ~2.7 GB for a 1B Q8_0 MoE). The cache is process-wide and shared
+  by every streaming pass, so the calibration-pool collection, a refit pass
+  and the artifact write each read the experts from disk only ONCE - after
+  that all block loads are served from RAM. This is the main lever for slow
+  storage (Google Colab disks, Google Drive mounts, HDDs): one sequential
+  file read replaces thousands of small random ones. On a machine where RAM
+  is too tight even for the packed file, stay on `disk` (prefetch +
+  io-threads still help).
 - The pool cache makes re-runs (new rank, new fit settings) skip stages 1-4
   entirely.
+
+Colab note: put the GGUF on the LOCAL disk (`/content`), not a Drive mount -
+a Drive FUSE mount turns every small read into a network round-trip. Then
+`--io-cache ram --io-threads 2-4` on a standard Colab VM (12.7 GB RAM) fits
+comfortably: packed GGUF (in cache) + backbone + one expert block.
 
 Rough per-step cost on a NanoColibri-sized block (d=1024, r=64, bs 4096,
 2 CPU cores): ~0.30 s/step after folding (was ~0.51 s) -> a 23-block fit at
@@ -420,14 +435,14 @@ see `modeling_field.py`).
 |---|---|
 | `hf_pipeline.py` | the WHOLE compression pipeline in one command (GGUF -> field r=32 -> verify); phased for memory |
 | `hf_gguf_to_hf.py` | Q4 GGUF download + dequant into a plain HF checkpoint (olmoe, hy_v3) |
-| `hf_stream.py` | streaming runner: backbone in RAM, experts per block, background prefetch |
+| `hf_stream.py` | streaming runner: backbone in RAM, experts per block, background prefetch, optional raw-GGUF RAM cache (`--io-cache ram`) |
 | `hf_field_transform.py` | the core: calibration (disk cache), field fit (several methods), deploy, metrics |
 | `hf_chat.py` | chat with the transformed model in a terminal (streaming output, commands) |
 | `hf_env.py` | redirects the HF cache into the project (imported first) |
 | `modeling_field_template.py` | the template of the artifact's modeling code |
 | `step1_compress.bat` / `step2_chat.bat` | double-click launchers on Windows |
 | `make_tiny_olmoe_gguf.py` / `make_tiny_hyv3_gguf.py` | mini-GGUF generators (environment check without a 4 GB download) |
-| `test_stream_mode.py`, `test_gguf_direct.py`, `test_field_fit_guard.py` | A/B tests (bit-exact streaming vs full model; GGUF vs checkpoint; fit guard) |
+| `test_stream_mode.py`, `test_gguf_direct.py`, `test_field_fit_guard.py`, `test_io_cache.py`, `test_io_cache_stream.py` | A/B tests (bit-exact streaming vs full model; GGUF vs checkpoint; fit guard; `--io-cache ram` correctness) |
 | `run_pipeline.sh` + `pipeline.py`, `common.py`, `train.py`, `transform_eval.py`, `variants_eval.py`, `upgrade_eval.py`, `bank_eval.py`, `masks_eval.py`, `field_eval.py`, `deploy.py`, `verify_transformed.py` | toy pipeline: trains a mini-MoE, compresses it, compares against baselines (SVD/PQ/BitDelta/dense) |
 | `examples/toy_report/` | mini-PoC reports and numbers |
 

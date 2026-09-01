@@ -762,7 +762,7 @@ def save_field_model(model, tokenizer, out_dir, rank, accounting, meta):
 
 def write_field_artifact(src, out_dir, pool_dir, fit_dir, rank, dtype,
                          max_shard_bytes=2_000_000_000, gguf=None, profile=None,
-                         io_workers=1):
+                         io_workers=1, io_cache="disk"):
     """Assemble the artifact (a plain HF model with the field) WITHOUT loading
     the model into RAM.
 
@@ -824,7 +824,8 @@ def write_field_artifact(src, out_dir, pool_dir, fit_dir, rank, dtype,
     gs = None
     if gguf is not None:                      # backbone straight from the GGUF
         from hf_gguf_to_hf import GgufHfSource
-        gs = GgufHfSource(gguf, io_workers=io_workers)
+        gs = GgufHfSource(gguf, io_workers=io_workers,
+                          cache_ram=(io_cache == "ram"))
     elif not src_files:
         raise RuntimeError(f"no safetensors files in {src}")
     for fn in src_files:

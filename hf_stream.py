@@ -53,13 +53,14 @@ class BlockStreamRunner:
     """
 
     def __init__(self, src, dtype=torch.bfloat16, device="cpu", progress=True,
-                 gguf=None, prefetch=1, io_workers=1):
+                 gguf=None, prefetch=1, io_workers=1, io_cache="disk"):
         from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
 
         self.src, self.dtype = src, dtype
         self.device = torch.device(device)
         self.progress = bool(progress)
         self._io_workers = max(1, int(io_workers))   # GGUF dequant threads
+        self._io_cache = str(io_cache)               # disk | ram (packed cache)
         self._gguf = self._open_gguf(gguf)   # weight source: None -> safetensors
         cfg = AutoConfig.from_pretrained(src)
         with torch.device("meta"):
@@ -76,6 +77,7 @@ class BlockStreamRunner:
         self._hooks = []
         self._stream_n = 0
         self._stream_bytes = 0
+        self._load_time = 0.0
         self._slow_hint = False
         self._expert_keys = {}
         self._moe_prefixes = []
@@ -126,7 +128,12 @@ class BlockStreamRunner:
         if not gguf:
             return None
         from hf_gguf_to_hf import GgufHfSource
-        return GgufHfSource(gguf, io_workers=self._io_workers)
+        if self._io_cache == "ram":
+            print(f"streaming: io-cache ram - raw GGUF tensors are copied to "
+                  f"RAM on first touch (~= the packed file size, ~2.7 GB for a "
+                  f"1B Q8 MoE); later passes read nothing from disk", flush=True)
+        return GgufHfSource(gguf, io_workers=self._io_workers,
+                            cache_ram=(self._io_cache == "ram"))
 
     @staticmethod
     def _module_names(model):
@@ -430,6 +437,7 @@ class BlockStreamRunner:
         self._stream_n += 1
         self._stream_bytes += nb
         dt = time.time() - t0
+        self._load_time += dt
         if self.progress:
             print(f"\r    ... experts from disk: {self._stream_n} block loads, "
                   f"{self._stream_bytes / 1e9:.0f} GB read (block {dt:.1f} s)",
@@ -485,7 +493,18 @@ class BlockStreamRunner:
         for f in self._handles.values():
             del f
         self._handles = {}
-        self._gguf = None            # release the GGUF mmap
         if self.progress:
+            avg = self._load_time / self._stream_n if self._stream_n else 0.0
             print(f"\n    streaming finished: {self._stream_n} block loads, "
-                  f"{self._stream_bytes / 1e9:.1f} GB read from disk", flush=True)
+                  f"{self._stream_bytes / 1e9:.1f} GB read from disk, "
+                  f"block-load time {self._load_time:.0f} s "
+                  f"(avg {avg:.2f} s/block)", flush=True)
+        if self._gguf is not None:
+            try:
+                n, gb, hits = self._gguf.cache_stats()
+                if n:
+                    print(f"    io-cache ram: {n} tensors ({gb:.2f} GB) held in "
+                          f"RAM, {hits} served-from-RAM hits", flush=True)
+            except AttributeError:
+                pass
+        self._gguf = None            # release the GGUF mmap

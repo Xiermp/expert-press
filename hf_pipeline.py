@@ -53,6 +53,9 @@ Fit tuning:
   --fit-workers 2                              # parallel fit of independent blocks
   --prefetch 0                                 # disable background block prefetch
                                                # (saves ~1 block of RAM)
+  --io-cache ram                               # keep packed GGUF tensors in RAM
+                                               # (first pass fills the cache,
+                                               # later passes read no disk)
 
 Windows: the same commands via double click - step1_compress.bat / step2_chat.bat.
 """
@@ -381,6 +384,11 @@ def main():
                     help="background prefetch of the next expert block while the "
                          "current layer computes (default 1; 0 = off, saves ~1 "
                          "block of RAM)")
+    ap.add_argument("--io-cache", choices=["disk", "ram"], default="disk",
+                    help="ram: copy the packed GGUF tensors into RAM on first "
+                         "touch (~= packed file size); later passes (pool "
+                         "collection, refit, artifact write) read nothing from "
+                         "disk - big win on Colab/Drive or HDD")
     ap.add_argument("--eval-chunks", type=int, default=50)
     ap.add_argument("--kl-chunks", type=int, default=16)
     ap.add_argument("--eval-ctx", type=int, default=512)
@@ -622,7 +630,8 @@ def main():
             try:
                 model = BlockStreamRunner(src, dtype=dtype, device=device,
                                           gguf=light_gguf, prefetch=args.prefetch,
-                                          io_workers=args.io_threads)
+                                          io_workers=args.io_threads,
+                                          io_cache=args.io_cache)
                 stream = model
             except Exception as e:  # noqa: BLE001
                 if light_gguf:
@@ -859,7 +868,8 @@ def main():
                     runner2 = BlockStreamRunner(src, dtype=dtype, device=device,
                                                 gguf=light_gguf,
                                                 prefetch=args.prefetch,
-                                                io_workers=args.io_threads)
+                                                io_workers=args.io_threads,
+                                                io_cache=args.io_cache)
                     blocks2 = find_moe_blocks(runner2)
                     stores = [[] for _ in range(n_blocks)]   # per-block list of (X,Y) chunk files
 
@@ -993,10 +1003,11 @@ def main():
                    fit_jitter=args.fit_jitter, fit_early_stop=args.fit_early_stop,
                    fit_preset=fit_preset or "none", fit_workers=args.fit_workers,
                    io_threads=args.io_threads,
-                   prefetch=args.prefetch, per_layer_cap=args.per_layer_cap)
+                   prefetch=args.prefetch, io_cache=args.io_cache,
+                   per_layer_cap=args.per_layer_cap)
     write_field_artifact(src, out_dir, pool_dir, fit_dir, args.rank, dtype,
                          gguf=light_gguf, profile=profile,
-                         io_workers=args.io_threads)
+                         io_workers=args.io_threads, io_cache=args.io_cache)
     full_b, field_b = field_accounting(geoms, args.rank)
     T.update(rank=args.rank, full_experts_mb=full_b / 1e6, field_mb=field_b / 1e6,
              ratio=full_b / max(field_b, 1), fit_mses=fit_mses,
