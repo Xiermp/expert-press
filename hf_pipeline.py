@@ -57,6 +57,20 @@ Fit tuning:
                                                # (first pass fills the cache,
                                                # later passes read no disk)
 
+Stage toggles (the auto-pipeline is a chain of 9 stages; any can be switched
+on/off - the plan is printed before the run):
+  python3 hf_pipeline.py --list-stages             # the stage table
+  python3 hf_pipeline.py --stages fit,save,verify  # run ONLY these (from cache)
+  python3 hf_pipeline.py --skip base,verify,report # run all EXCEPT these
+  python3 hf_pipeline.py --skip download           # reuse-only: never touch the network
+  python3 hf_pipeline.py --stages fit --rank 64    # a new rank from the cached pool
+  python3 hf_pipeline.py --stages refine --refine-rounds 1  # refine implies rounds>=1
+  --gen-tokens 0        # no demo generations (saves a streaming pass)
+  --no-cache-verify     # skip the 2-chunk log-prob cache self-check
+Cheap missing stages (texts/download) are auto-added with a notice; expensive
+ones (base/calibrate/fit/verify) fail fast with a hint instead of surprising
+you with a multi-hour pass. A re-run also auto-skips whatever is cached.
+
 Windows: the same commands via double click - step1_compress.bat / step2_chat.bat.
 """
 import argparse
@@ -91,6 +105,21 @@ FIT_PRESETS = {
 }
 FIT_LEGACY = dict(fit_steps=300, fit_bs=4096, fit_lr=2e-3, fit_method="adam")
 T = {}
+
+# Pipeline stages: togglable via --stages / --skip (names in run order).
+STAGE_ORDER = ["download", "texts", "base", "calibrate", "fit", "refine",
+               "save", "verify", "report"]
+STAGE_DESCR = {
+    "download":  "download   1   source: GGUF resolve/download + light catalog (config+tokenizer)",
+    "texts":     "texts      2   calibration/eval text split + tokenization",
+    "base":      "base       3   base ppl/log-prob cache/demo generation (STREAMING)",
+    "calibrate": "calibrate  4   pair pool + block centroids/geometry (STREAMING)",
+    "fit":       "fit        5   field fit per block (no model in RAM)",
+    "refine":    "refine     5b  self-distillation refit rounds (--refine-rounds; default off)",
+    "save":      "save       6   assemble the artifact STREAMINGLY",
+    "verify":    "verify     7   reload artifact: KL/ppl vs base + demo generation",
+    "report":    "report     8   write reports (artifact README + results/)",
+}
 
 
 def banner(msg):
@@ -228,22 +257,23 @@ def do_cleanup(targets):
     print(f"freed {freed:.2f} GB", flush=True)
 
 
-def cache_is_complete(cache_dir, lp_dir, min_pairs=0):
+def cache_is_complete(cache_dir, lp_dir, min_pairs=0, pairs_only=False):
     """Pair pool + base log-probs already on disk? -> block count (0 = no).
     Pairs/centroids/log-probs depend on neither rank nor text order - such a
     cache survives a --rank/--fit-* change, and --cleanup does NOT touch it.
     min_pairs: when the cached pool holds FEWER pairs per block than the
     requested --per-layer-cap, the cache is treated as incomplete (the caller
-    recalibrates with the bigger cap)."""
+    recalibrates with the bigger cap).
+    pairs_only: check ONLY the pair pool + centroids (art_meta/pairs/init),
+    without the base log-prob cache - enough for fit/save/refine, which never
+    read the log-probs; the full check is needed by base/verify."""
     import torch as _t
     am = os.path.join(cache_dir, "art_meta.json")
-    tp = os.path.join(cache_dir, "eval_tokens.pt")
-    if not (os.path.isfile(am) and os.path.isfile(tp)):
+    if not os.path.isfile(am):
         return 0
     try:
         with open(am, encoding="utf-8") as f:
             n = int(json.load(f)["n_layers"])
-        d = _t.load(tp, map_location="cpu")
     except Exception:
         return 0
     if not all(os.path.isfile(os.path.join(cache_dir, f"pairs_blk{i}.pt"))
@@ -252,9 +282,17 @@ def cache_is_complete(cache_dir, lp_dir, min_pairs=0):
     if not all(os.path.isfile(os.path.join(cache_dir, f"init_blk{i}.pt"))
                for i in range(n)):
         return 0
-    if not all(os.path.isfile(os.path.join(lp_dir, f"lp_{i:03d}.pt"))
-               for i in range(len(d["X"]))):
-        return 0
+    if not pairs_only:
+        tp = os.path.join(cache_dir, "eval_tokens.pt")
+        if not os.path.isfile(tp):
+            return 0
+        try:
+            d = _t.load(tp, map_location="cpu")
+        except Exception:
+            return 0
+        if not all(os.path.isfile(os.path.join(lp_dir, f"lp_{i:03d}.pt"))
+                   for i in range(len(d["X"]))):
+            return 0
     if min_pairs:
         try:
             x0 = _t.load(os.path.join(cache_dir, "pairs_blk0.pt"),
@@ -283,6 +321,115 @@ def resolve_fit_args(args):
         if v is not None:
             fit[k] = v
     return fit, preset
+
+
+def resolve_plan(args):
+    """--stages / --skip / --skip-reload-check -> a validated stage list
+    (STAGE_ORDER subset). Also handles --list-stages and the refine defaults."""
+    if args.list_stages:
+        print("\nPipeline stages (run order):")
+        for s in STAGE_ORDER:
+            print(f"  {STAGE_DESCR[s]}")
+        print("\ntoggles:")
+        print("  --stages fit,save,verify   run ONLY these stages")
+        print("  --skip base,report         run all EXCEPT these")
+        print("  --skip download            reuse-only: no network/downloads")
+        print("  (--skip-reload-check == --skip verify; a re-run also auto-skips")
+        print("   whatever is already cached: pool, log-probs, fits)")
+        sys.exit(0)
+    if args.stages and args.skip:
+        sys.exit("use either --stages or --skip, not both")
+    if args.stages:
+        wanted = {s.strip() for s in args.stages.split(",") if s.strip()}
+    else:
+        skipped = {s.strip() for s in (args.skip or "").split(",") if s.strip()}
+        wanted = set(STAGE_ORDER) - skipped
+    bad = wanted - set(STAGE_ORDER)
+    if bad:
+        sys.exit(f"unknown stage(s): {', '.join(sorted(bad))}\n"
+                 f"known stages: {', '.join(STAGE_ORDER)}  (--list-stages for details)")
+    if not wanted:
+        sys.exit("empty stage plan (--list-stages shows the stage table)")
+    if args.skip_reload_check and "verify" in wanted:
+        wanted.discard("verify")
+        print("--skip-reload-check: 'verify' removed from the plan (== --skip verify)",
+              flush=True)
+    if "refine" in wanted and args.refine_rounds == 0 and not args.stages:
+        wanted.discard("refine")   # refine is opt-in: the default plan leaves 5b off
+    if "refine" in wanted and args.refine_rounds == 0 and args.stages:
+        # refine is opt-in: an explicit --stages refine implies at least 1 round;
+        # the default plan keeps rounds=0 (stage 5b off, as before)
+        args.refine_rounds = 1
+        print("'refine' requested via --stages without --refine-rounds: "
+              "defaulting to 1 round", flush=True)
+    if "refine" not in wanted and args.refine_rounds > 0:
+        print(f"note: --refine-rounds {args.refine_rounds} ignored - 'refine' is "
+              f"not in the plan", flush=True)
+    return [s for s in STAGE_ORDER if s in wanted]
+
+
+def ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, min_pairs):
+    """Auto-add cheap missing stages with a notice; hard-fail with a hint when
+    an expensive prerequisite is absent from disk AND from the plan. Returns
+    the final ordered plan."""
+    full = cache_is_complete(pool_dir, lp_dir, min_pairs=min_pairs)
+    pairs = full or cache_is_complete(pool_dir, lp_dir, min_pairs=min_pairs,
+                                      pairs_only=True)
+    auto = []
+
+    def add(s):
+        if s not in plan:
+            plan.append(s)
+            auto.append(s)
+
+    if plan != ["report"]:          # anything but a pure report rerun needs src
+        add("download")
+    if "refine" in plan:
+        add("texts")
+    if "calibrate" in plan and not pairs:
+        add("texts")
+    if "fit" in plan and not pairs and "calibrate" not in plan:
+        hint = ""
+        try:
+            import torch as _t
+            x0 = _t.load(os.path.join(pool_dir, "pairs_blk0.pt"),
+                         map_location="cpu")["X"]
+            hint = f"\n  -> or lower --per-layer-cap (the cached pool holds " \
+                   f"{x0.shape[0]} pairs/block)"
+        except Exception:  # noqa: BLE001
+            pass
+        sys.exit(f"stage 'fit': the pair pool is missing/incomplete in {pool_dir}\n"
+                 "  -> run the full pipeline once (keep base+calibrate in the "
+                 f"plan), or drop 'fit' from --stages{hint}")
+    if ("save" in plan or "refine" in plan) and "fit" not in plan:
+        n = pairs or 0
+        if not n or not all(os.path.isfile(os.path.join(fit_dir, f"fit_blk{i}.pt"))
+                            for i in range(n)):
+            what = "stage 'refine': the fits" if "refine" in plan else \
+                   "stage 'save': the fits"
+            sys.exit(f"{what} are missing in {fit_dir}\n"
+                     "  -> keep 'fit' in the plan, or finish a full run first")
+    if "verify" in plan:
+        if not full and "base" not in plan:
+            sys.exit("stage 'verify': the base log-prob cache is missing/"
+                     f"incomplete in {lp_dir}\n"
+                     "  -> keep 'base' in the plan (one streaming pass builds "
+                     "the cache), or --skip verify")
+        if "save" not in plan and not os.path.isfile(os.path.join(out_dir,
+                                                                 "config.json")):
+            sys.exit(f"stage 'verify': no artifact to verify at {out_dir}\n"
+                     "  -> keep 'save' in the plan, or pass --out <artifact dir>")
+    if auto:
+        plan = [s for s in STAGE_ORDER if s in plan]
+        print(f"plan adjusted, cheap stages auto-added: +{', '.join(auto)}",
+              flush=True)
+    plan = [s for s in STAGE_ORDER if s in plan]
+    print(f"\nPLAN: {' -> '.join(plan)}", flush=True)
+    skipped = [s for s in STAGE_ORDER if s not in plan]
+    if skipped:
+        print(f"skipped: {', '.join(skipped)}", flush=True)
+    T["plan"], T["plan_skipped"] = plan, skipped
+    return plan
 
 
 def print_profile(args, fit, preset):
@@ -424,10 +571,20 @@ def main():
                     help="do not abort the run if the field fit failed to beat the "
                          "centroid baseline (degradation guard)")
     ap.add_argument("--skip-reload-check", action="store_true",
-                    help="skip the artifact check (field metrics will not be computed)")
+                    help="skip the artifact check (same as --skip verify)")
+    ap.add_argument("--stages", default=None, metavar="A,B,...",
+                    help="run ONLY these stages, e.g. fit,save,verify (names: "
+                         "--list-stages). Mutually exclusive with --skip")
+    ap.add_argument("--skip", default=None, metavar="A,B,...",
+                    help="run all stages EXCEPT these, e.g. base,verify,report")
+    ap.add_argument("--list-stages", action="store_true",
+                    help="print the stage table and exit")
+    ap.add_argument("--no-cache-verify", action="store_true",
+                    help="skip the 2-chunk log-prob cache self-check (stage 3)")
     ap.add_argument("--smoke", action="store_true",
                     help="mini wiring run: short fit/eval")
     args = ap.parse_args()
+    plan = resolve_plan(args)          # may exit (--list-stages / bad names)
     if args.smoke:
         args.calib_windows, args.calib_bsz, args.calib_ctx = 2, 2, 128
         args.per_layer_cap, args.fit_steps, args.fit_bs = 2048, 60, 2048
@@ -496,8 +653,12 @@ def main():
     lp_dir = os.path.join(pool_dir, "lp_base")
     os.makedirs(lp_dir, exist_ok=True)
     out_dir = args.out or os.path.join(DL, f"field_{tag}_r{args.rank}")
+    T["cache_dir"], T["fit_dir"] = pool_dir, fit_dir
+    mp = 0 if args.smoke else args.per_layer_cap
+    plan = ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, mp)
 
-    banner(f"STAGE 1 - download: {args.model}")
+    reuse_only = "download" not in plan
+    banner(f"STAGE 1 - {'reuse-only (--skip download: no network)' if reuse_only else 'download'}: {args.model}")
     quantized = False
     conv_dir = gguf_path = None
     light_gguf = None          # weights are read straight from the GGUF (on-the-fly dequant)
@@ -509,7 +670,7 @@ def main():
         from types import SimpleNamespace
         gguf_path, src_name = g2h.resolve_gguf(SimpleNamespace(
             gguf=args.gguf, repo=args.model, quant=args.gguf_quant,
-            gguf_file=args.gguf_file))
+            gguf_file=args.gguf_file), local_only=reuse_only)
         base_repo = args.gguf_base_repo or g2h.auto_base_repo(gguf_path) \
             or "allenai/OLMoE-1B-7B-0924"
         if not args.gguf_base_repo:
@@ -524,6 +685,10 @@ def main():
             if g2h.has_full_weights(conv_dir):
                 banner("STAGE 1b - --full-dequant: dequant checkpoint already "
                        "on disk, using it")
+            elif reuse_only:
+                sys.exit("--skip download + --full-dequant: no dequant checkpoint "
+                         f"at {conv_dir}\n  -> drop 'download' from --skip once to "
+                         "build it, or drop --full-dequant")
             else:
                 banner("STAGE 1b - dequant GGUF -> full HF checkpoint "
                        "(~14 GB on disk, --full-dequant)")
@@ -554,6 +719,10 @@ def main():
                 src = conv_dir
                 print("light catalog already in place for this GGUF - skipping",
                       flush=True)
+            elif reuse_only:
+                sys.exit("--skip download: the light catalog for this GGUF is not "
+                         f"built yet ({conv_dir})\n  -> drop 'download' from --skip "
+                         "once (it only reads config/tokenizer + writes a marker)")
             else:
                 src = g2h.prepare_light_dir(gguf_path, conv_dir,
                                             base_repo=base_repo)
@@ -568,9 +737,17 @@ def main():
             cleanup_targets.append(conv_dir)
         T["_gguf_path"] = gguf_path
     else:
-        src = args.local_path or snapshot_download(
-            args.model, allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model",
-                                        "*.jinja"])
+        try:
+            src = args.local_path or snapshot_download(
+                args.model, allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model",
+                                            "*.jinja"],
+                local_files_only=reuse_only)
+        except Exception as e:  # noqa: BLE001
+            if reuse_only:
+                sys.exit(f"--skip download: {args.model} is not in the local HF "
+                         f"cache ({type(e).__name__})\n  -> drop 'download' from "
+                         "--skip once, or pass --local-path")
+            raise
         with open(os.path.join(src, "config.json"), encoding="utf-8") as f:
             src_quant = (json.load(f).get("quantization_config") or {}).get("quant_method")
         quantized = src_quant in ("bitsandbytes", "bnb-4bit")
@@ -590,29 +767,38 @@ def main():
                      for f in os.listdir(src) if f.endswith(".safetensors")) / 1e9
         base_total_b = int(src_gb * 1e9)
 
-    banner("STAGE 2 - texts: calibration/eval")
-    calib_text, eval_text = resolve_texts(args)
-    calib_ids = torch.tensor(tokenizer(calib_text)["input_ids"])
-    eval_ids = torch.tensor(tokenizer(eval_text)["input_ids"])
-    print(f"tokens: calib {len(calib_ids)}, eval {len(eval_ids)}", flush=True)
+    if "texts" in plan:
+        banner("STAGE 2 - texts: calibration/eval")
+        calib_text, eval_text = resolve_texts(args)
+        calib_ids = torch.tensor(tokenizer(calib_text)["input_ids"])
+        eval_ids = torch.tensor(tokenizer(eval_text)["input_ids"])
+        print(f"tokens: calib {len(calib_ids)}, eval {len(eval_ids)}", flush=True)
+    else:
+        banner("STAGE 2 - texts: skipped (--skip texts; token ids come from the "
+               "run cache)")
+        calib_ids, eval_ids = None, None
 
     # ========== PHASE A - base + calibration: STREAMING (model not in RAM) =====
-    have_cache = cache_is_complete(pool_dir, lp_dir,
-                                   min_pairs=0 if args.smoke else args.per_layer_cap)
+    full_cache = cache_is_complete(pool_dir, lp_dir, min_pairs=mp)
+    pairs_cache = full_cache or cache_is_complete(pool_dir, lp_dir, min_pairs=mp,
+                                                  pairs_only=True)
+    base_pass = "base" in plan and not full_cache
+    calib_pass = "calibrate" in plan and not pairs_cache
     stream = None
-    if have_cache:
-        banner("STAGES 3-4 - cache found: pair pool + base log-probs already on disk")
-        print(f"calibration is a pool of activation vectors (text order does not "
-              f"matter), the base log-probs are cached too: base/calibration "
-              f"stages skipped entirely\ncache: {pool_dir}", flush=True)
-        d = torch.load(os.path.join(pool_dir, "eval_tokens.pt"), map_location="cpu")
-        X, Y, eval_ids = d["X"], d["Y"], d["eval_ids"]
-        base_m = base_metrics_from_cache(lp_dir, X, Y)
-        base_gen = None
-        print(f"BASE ({base_label()}) (from the log-prob cache): ppl {base_m['ppl']:.2f}",
-              flush=True)
+    base_gen = None
+    if not base_pass and not calib_pass:
+        banner("PHASE A - no streaming pass needed: everything from the run cache")
+        X = Y = eval_ids = None
+        base_m = None
+        if full_cache:
+            d = torch.load(os.path.join(pool_dir, "eval_tokens.pt"),
+                           map_location="cpu")
+            X, Y, eval_ids = d["X"], d["Y"], d["eval_ids"]
+            base_m = base_metrics_from_cache(lp_dir, X, Y)
+            print(f"BASE ({base_label()}) (from the log-prob cache): "
+                  f"ppl {base_m['ppl']:.2f}", flush=True)
         pairs = []
-        for i in range(have_cache):
+        for i in range(pairs_cache):
             p = os.path.join(pool_dir, f"pairs_blk{i}.pt")
             n = load_pairs_block(p)[0].shape[0]
             pairs.append((p, n))
@@ -622,7 +808,10 @@ def main():
         act = ACT2FN[cfg.hidden_act]
     else:
         banner("STAGE 3 - base: ppl/log-probs/generation "
-               "(STREAMING: the full model never loads)")
+               "(STREAMING: the full model never loads)"
+               if base_pass else
+               "STAGE 4 prep - loading the source for calibration (base metrics "
+               "are skipped: --skip base / cached)")
         stream = None
         if quantized:
             model = load_source_model(args, src, dtype, device, quantized)
@@ -660,69 +849,75 @@ def main():
                 print(f"model loaded; total {base_total_b / 1e9:.2f} GB "
                       f"(fp16 accounting)", flush=True)
         cfg = model.config
+        act = ACT2FN[cfg.hidden_act]      # also needed by the fit when the pairs
+                                          # come from the cache (stage 4 skipped)
 
-        if stream and args.gen_tokens > 12:
-            args.gen_tokens = 12
-            print("demo generation shortened to 12 tokens: in streaming every "
-                  "step reads experts from disk", flush=True)
+        if base_pass:
+            if stream and args.gen_tokens > 12:
+                args.gen_tokens = 12
+                print("demo generation shortened to 12 tokens: in streaming every "
+                      "step reads experts from disk", flush=True)
 
-        X, Y = eval_logits_cache_disk(model, eval_ids, args.eval_ctx,
-                                      args.kl_chunks, lp_dir)
-        torch.save({"X": X, "Y": Y, "eval_ids": eval_ids},
-                   os.path.join(pool_dir, "eval_tokens.pt"))
-        # cache check: 2 chunks suffice for the base (the cache is its own
-        # log-probs; a full check = wasted passes, expensive in streaming)
-        chk = eval_vs_cache_disk(model, X, Y, lp_dir, n_max=2)
-        print(f"log-prob cache verified on 2 chunks: KL {chk['kl_bits']:.4f} bits",
-              flush=True)
-        base_m = base_metrics_from_cache(lp_dir, X, Y)
-        base_gen = generate_text(model, eval_ids, tokenizer,
-                                 n_new=args.gen_tokens,
-                                 repetition_penalty=args.gen_rep_pen)
-        print(f"BASE ({base_label()}): ppl {base_m['ppl']:.2f} (from the log-prob cache)",
-              flush=True)
-        T["base_total_mb"] = base_total_b / 1e6
+            X, Y = eval_logits_cache_disk(model, eval_ids, args.eval_ctx,
+                                          args.kl_chunks, lp_dir)
+            torch.save({"X": X, "Y": Y, "eval_ids": eval_ids},
+                       os.path.join(pool_dir, "eval_tokens.pt"))
+            if not args.no_cache_verify:
+                # cache check: 2 chunks suffice for the base (the cache is its own
+                # log-probs; a full check = wasted passes, expensive in streaming)
+                chk = eval_vs_cache_disk(model, X, Y, lp_dir, n_max=2)
+                print(f"log-prob cache verified on 2 chunks: "
+                      f"KL {chk['kl_bits']:.4f} bits", flush=True)
+            base_m = base_metrics_from_cache(lp_dir, X, Y)
+            if args.gen_tokens > 0:
+                base_gen = generate_text(model, eval_ids, tokenizer,
+                                         n_new=args.gen_tokens,
+                                         repetition_penalty=args.gen_rep_pen)
+            print(f"BASE ({base_label()}): ppl {base_m['ppl']:.2f} "
+                  f"(from the log-prob cache)", flush=True)
+            T["base_total_mb"] = base_total_b / 1e6
 
-        banner("STAGE 4 - calibration: pairs to disk + centroids (STREAMING, "
-               "weights - quantized GGUF)")
-        blocks = find_moe_blocks(model)
-        geoms = [block_geometry(b, cfg) for _, b in blocks]
-        act = ACT2FN[cfg.hidden_act]
-        print(f"MoE blocks: {len(blocks)}; first geometry: {geoms[0]}", flush=True)
-        gen = torch.Generator().manual_seed(11)
-        batches = make_batches(calib_ids, args.calib_ctx, args.calib_bsz,
-                               args.calib_windows, device, gen)
-        pairs = collect_pairs(model, blocks, batches, args.per_layer_cap,
-                              flush_dir=pool_dir)
-        for i, (p, n) in enumerate(pairs):
-            print(f"  block {i}: {n} pairs -> {os.path.basename(p) if p else 'EMPTY!'}",
+        if calib_pass:
+            banner("STAGE 4 - calibration: pairs to disk + centroids (STREAMING, "
+                   "weights - quantized GGUF)")
+            blocks = find_moe_blocks(model)
+            geoms = [block_geometry(b, cfg) for _, b in blocks]
+            print(f"MoE blocks: {len(blocks)}; first geometry: {geoms[0]}",
                   flush=True)
-            if n == 0:
-                sys.exit("no pairs for a block - increase --calib-windows / text")
-        for i, (_, block) in enumerate(blocks):
-            if stream:
-                with stream.with_block(i):
-                    mgu, mdn = expert_means(block)
-            else:
-                mgu, mdn = expert_means(block)          # without an fp32 expert stack
-            # hy_v3: selection bias + shared experts (backbone already in RAM)
-            eb = block_router_bias(block)
-            sh = block_shared_weights(block)
-            if eb is not None or sh is not None:
-                print(f"  block {i}: bias {'yes' if eb is not None else 'no'}, "
-                      f"shared {'yes' if sh is not None else 'no'}", flush=True)
-            torch.save(dict(geom=geoms[i], gw=router_weight(block.gate).clone(),
-                            mgu=mgu, mdn=mdn, eb=eb, shared=sh),
-                       os.path.join(pool_dir, f"init_blk{i}.pt"))
-        with open(os.path.join(pool_dir, "art_meta.json"), "w",
-                  encoding="utf-8") as f:
-            base_obj = model.model if stream else model
-            json.dump(dict(base_cls=type(base_obj).__name__,
-                           router_cls=type(blocks[0][1].gate).__name__,
-                           router_mod=type(blocks[0][1].gate).__module__,
-                           n_layers=len(blocks),
-                           block_names=[n for n, _ in blocks]), f,
-                      ensure_ascii=False, indent=2)
+            gen = torch.Generator().manual_seed(11)
+            batches = make_batches(calib_ids, args.calib_ctx, args.calib_bsz,
+                                   args.calib_windows, device, gen)
+            pairs = collect_pairs(model, blocks, batches, args.per_layer_cap,
+                                  flush_dir=pool_dir)
+            for i, (p, n) in enumerate(pairs):
+                print(f"  block {i}: {n} pairs -> "
+                      f"{os.path.basename(p) if p else 'EMPTY!'}", flush=True)
+                if n == 0:
+                    sys.exit("no pairs for a block - increase --calib-windows / text")
+            for i, (_, block) in enumerate(blocks):
+                if stream:
+                    with stream.with_block(i):
+                        mgu, mdn = expert_means(block)
+                else:
+                    mgu, mdn = expert_means(block)      # without an fp32 expert stack
+                # hy_v3: selection bias + shared experts (backbone already in RAM)
+                eb = block_router_bias(block)
+                sh = block_shared_weights(block)
+                if eb is not None or sh is not None:
+                    print(f"  block {i}: bias {'yes' if eb is not None else 'no'}, "
+                          f"shared {'yes' if sh is not None else 'no'}", flush=True)
+                torch.save(dict(geom=geoms[i], gw=router_weight(block.gate).clone(),
+                                mgu=mgu, mdn=mdn, eb=eb, shared=sh),
+                           os.path.join(pool_dir, f"init_blk{i}.pt"))
+            with open(os.path.join(pool_dir, "art_meta.json"), "w",
+                      encoding="utf-8") as f:
+                base_obj = model.model if stream else model
+                json.dump(dict(base_cls=type(base_obj).__name__,
+                               router_cls=type(blocks[0][1].gate).__name__,
+                               router_mod=type(blocks[0][1].gate).__module__,
+                               n_layers=len(blocks),
+                               block_names=[n for n, _ in blocks]), f,
+                          ensure_ascii=False, indent=2)
 
         print("unloading the backbone - the fit runs without it", flush=True)
         if stream:
@@ -730,102 +925,116 @@ def main():
         release_model(model, device)
         stream = None
     T["stream_mode"] = bool(stream)
-    T["reused_cache"] = bool(have_cache)
+    T["reused_cache"] = bool(pairs_cache) and not calib_pass
 
     # ================= PHASE B - field fit: model NOT in RAM ==================
-    banner(f"STAGE 5 - field fit r={args.rank} on pairs from disk "
-           f"({args.fit_method}, model NOT in RAM)")
+
     n_blocks = len(pairs)
-    os.makedirs(fit_dir, exist_ok=True)
-    fit_sig = dict(fit_steps=args.fit_steps, fit_bs=args.fit_bs, fit_lr=args.fit_lr,
-                   fit_method=args.fit_method, fit_jitter=args.fit_jitter,
-                   fit_early_stop=args.fit_early_stop,
-                   preset=fit_preset or "none")
-    fit_meta_p = os.path.join(fit_dir, "fit_meta.json")
-    fit_done = all(os.path.isfile(os.path.join(fit_dir, f"fit_blk{i}.pt"))
-                   for i in range(n_blocks)) and os.path.isfile(fit_meta_p)
-    if fit_done:
-        with open(fit_meta_p, encoding="utf-8") as f:
-            fit_done = json.load(f) == fit_sig
-    if fit_done:
-        print(f"fit r={args.rank} with the same settings already cached - "
-              f"skipping (new fit: delete {fit_dir} or change --fit-steps/--fit-method)",
-              flush=True)
+    if "fit" not in plan:
+        banner(f"STAGE 5 - field fit r={args.rank}: skipped (--skip fit); "
+               f"fit files are taken from {fit_dir}")
+        fit_mses = [None] * n_blocks
         try:
             with open(os.path.join(fit_dir, "mse.json"), encoding="utf-8") as f:
                 fit_mses = json.load(f)
+            if len(fit_mses) != n_blocks:
+                fit_mses = [None] * n_blocks
         except Exception:
-            fit_mses = [None] * n_blocks
+            pass
     else:
-        def fit_one(i):
-            """Fit a single block (thread-safe: only local state + files)."""
-            Xi, Yi = load_pairs_block(pairs[i][0])
-            ini = torch.load(os.path.join(pool_dir, f"init_blk{i}.pt"),
-                             map_location="cpu")
-            fit_mod = FieldSparseMoe(ini["geom"], args.rank, gate_w=ini["gw"],
-                                     act_fn=act, gate_bias=ini.get("eb"),
-                                     shared=ini.get("shared")).to(device)
-            with torch.no_grad():
-                fit_mod.wgud.copy_(ini["mgu"])
-                fit_mod.wdnd.copy_(ini["mdn"])
-            mse = fit_field_module(fit_mod, Xi, Yi, args.fit_steps, args.fit_bs,
-                                   args.fit_lr, device,
-                                   log_prefix=f"block {i}/{n_blocks}",
-                                   guard=not args.skip_fit_guard,
-                                   method=args.fit_method, seed=5 + i,
-                                   jitter=args.fit_jitter,
-                                   early_stop=args.fit_early_stop)
-            torch.save({n: getattr(fit_mod, n).detach().clone()
-                        for n in fit_mod.field_names},
-                       os.path.join(fit_dir, f"fit_blk{i}.pt"))
-            del fit_mod, Xi, Yi
-            gc.collect()
-            return mse
-
-        fit_mses = [None] * n_blocks
-        errors = []
-        w = max(1, min(int(args.fit_workers), n_blocks))
-        if w > 1:
-            if not args.threads:
-                per = max(1, (os.cpu_count() or 2) // w)
-                torch.set_num_threads(per)
-                print(f"parallel fit: {w} workers x {per} cpu threads "
-                      f"(--fit-workers)", flush=True)
-            work = queue.Queue()
-            for i in range(n_blocks):
-                work.put(i)
-            lk = threading.Lock()
-
-            def run_worker():
-                while True:
-                    try:
-                        i = work.get_nowait()
-                    except queue.Empty:
-                        return
-                    try:
-                        mse = fit_one(i)
-                        with lk:
-                            fit_mses[i] = mse
-                    except Exception as e:  # noqa: BLE001
-                        with lk:
-                            errors.append((i, e))
-
-            ths = [threading.Thread(target=run_worker, name=f"fit-{k}",
-                                    daemon=True) for k in range(w)]
-            for t in ths:
-                t.start()
-            for t in ths:
-                t.join()
-            if errors:
-                i, e = errors[0]
-                raise RuntimeError(f"fit failed on block {i}: {e}") from e
+        banner(f"STAGE 5 - field fit r={args.rank} on pairs from disk "
+               f"({args.fit_method}, model NOT in RAM)")
+        os.makedirs(fit_dir, exist_ok=True)
+        fit_sig = dict(fit_steps=args.fit_steps, fit_bs=args.fit_bs, fit_lr=args.fit_lr,
+                       fit_method=args.fit_method, fit_jitter=args.fit_jitter,
+                       fit_early_stop=args.fit_early_stop,
+                       preset=fit_preset or "none")
+        fit_meta_p = os.path.join(fit_dir, "fit_meta.json")
+        fit_done = all(os.path.isfile(os.path.join(fit_dir, f"fit_blk{i}.pt"))
+                       for i in range(n_blocks)) and os.path.isfile(fit_meta_p)
+        if fit_done:
+            with open(fit_meta_p, encoding="utf-8") as f:
+                fit_done = json.load(f) == fit_sig
+        if fit_done:
+            print(f"fit r={args.rank} with the same settings already cached - "
+                  f"skipping (new fit: delete {fit_dir} or change --fit-steps/--fit-method)",
+                  flush=True)
+            try:
+                with open(os.path.join(fit_dir, "mse.json"), encoding="utf-8") as f:
+                    fit_mses = json.load(f)
+            except Exception:
+                fit_mses = [None] * n_blocks
         else:
-            for i in range(n_blocks):
-                fit_mses[i] = fit_one(i)
-        with open(os.path.join(fit_dir, "mse.json"), "w", encoding="utf-8") as f:
-            json.dump(fit_mses, f)
-        with open(fit_meta_p, "w", encoding="utf-8") as f:
-            json.dump(fit_sig, f)
+            def fit_one(i):
+                """Fit a single block (thread-safe: only local state + files)."""
+                Xi, Yi = load_pairs_block(pairs[i][0])
+                ini = torch.load(os.path.join(pool_dir, f"init_blk{i}.pt"),
+                                 map_location="cpu")
+                fit_mod = FieldSparseMoe(ini["geom"], args.rank, gate_w=ini["gw"],
+                                         act_fn=act, gate_bias=ini.get("eb"),
+                                         shared=ini.get("shared")).to(device)
+                with torch.no_grad():
+                    fit_mod.wgud.copy_(ini["mgu"])
+                    fit_mod.wdnd.copy_(ini["mdn"])
+                mse = fit_field_module(fit_mod, Xi, Yi, args.fit_steps, args.fit_bs,
+                                       args.fit_lr, device,
+                                       log_prefix=f"block {i}/{n_blocks}",
+                                       guard=not args.skip_fit_guard,
+                                       method=args.fit_method, seed=5 + i,
+                                       jitter=args.fit_jitter,
+                                       early_stop=args.fit_early_stop)
+                torch.save({n: getattr(fit_mod, n).detach().clone()
+                            for n in fit_mod.field_names},
+                           os.path.join(fit_dir, f"fit_blk{i}.pt"))
+                del fit_mod, Xi, Yi
+                gc.collect()
+                return mse
+
+            fit_mses = [None] * n_blocks
+            errors = []
+            w = max(1, min(int(args.fit_workers), n_blocks))
+            if w > 1:
+                if not args.threads:
+                    per = max(1, (os.cpu_count() or 2) // w)
+                    torch.set_num_threads(per)
+                    print(f"parallel fit: {w} workers x {per} cpu threads "
+                          f"(--fit-workers)", flush=True)
+                work = queue.Queue()
+                for i in range(n_blocks):
+                    work.put(i)
+                lk = threading.Lock()
+
+                def run_worker():
+                    while True:
+                        try:
+                            i = work.get_nowait()
+                        except queue.Empty:
+                            return
+                        try:
+                            mse = fit_one(i)
+                            with lk:
+                                fit_mses[i] = mse
+                        except Exception as e:  # noqa: BLE001
+                            with lk:
+                                errors.append((i, e))
+
+                ths = [threading.Thread(target=run_worker, name=f"fit-{k}",
+                                        daemon=True) for k in range(w)]
+                for t in ths:
+                    t.start()
+                for t in ths:
+                    t.join()
+                if errors:
+                    i, e = errors[0]
+                    raise RuntimeError(f"fit failed on block {i}: {e}") from e
+            else:
+                for i in range(n_blocks):
+                    fit_mses[i] = fit_one(i)
+            with open(os.path.join(fit_dir, "mse.json"), "w", encoding="utf-8") as f:
+                json.dump(fit_mses, f)
+            with open(fit_meta_p, "w", encoding="utf-8") as f:
+                json.dump(fit_sig, f)
+
 
     # ========== STAGE 5b - refine rounds (self-distillation) ==================
     # The first fit is calibrated on the BASE model's activations, but at
@@ -834,7 +1043,7 @@ def main():
     # one streaming pass where the field model feeds forward (hook-replaced
     # outputs) while the original GGUF experts provide the targets, then a
     # warm-started refit on those pairs.
-    if args.refine_rounds > 0:
+    if "refine" in plan and args.refine_rounds > 0:
         if quantized:
             print("refine rounds need a GGUF/safetensors source (original "
                   "experts must be loadable per block) - skipping", flush=True)
@@ -989,37 +1198,42 @@ def main():
               + " (outliers -> candidates for --refine-rounds)", flush=True)
 
     # ================= PHASE C - streaming artifact + verify ==================
-    banner("STAGE 6 - building the artifact STREAMINGLY (the full model is not needed)")
-    n_blocks = len(fit_mses)
-    geoms = [torch.load(os.path.join(pool_dir, f"init_blk{i}.pt"),
-                        map_location="cpu")["geom"] for i in range(n_blocks)]
-    if quantized and args.save_backbone == "bf16":
-        sys.exit("--save-backbone bf16 for a bnb source is not supported in the "
-                 "streaming mode: take a GGUF source (it is light anyway)")
     T["save_backbone"] = "keep"
-    profile = dict(model=args.model, quant=str(args.gguf_quant), rank=args.rank,
-                   fit_method=args.fit_method, fit_steps=args.fit_steps,
-                   fit_bs=args.fit_bs, fit_lr=args.fit_lr,
-                   fit_jitter=args.fit_jitter, fit_early_stop=args.fit_early_stop,
-                   fit_preset=fit_preset or "none", fit_workers=args.fit_workers,
-                   io_threads=args.io_threads,
-                   prefetch=args.prefetch, io_cache=args.io_cache,
-                   per_layer_cap=args.per_layer_cap)
-    write_field_artifact(src, out_dir, pool_dir, fit_dir, args.rank, dtype,
-                         gguf=light_gguf, profile=profile,
-                         io_workers=args.io_threads, io_cache=args.io_cache)
-    full_b, field_b = field_accounting(geoms, args.rank)
-    T.update(rank=args.rank, full_experts_mb=full_b / 1e6, field_mb=field_b / 1e6,
-             ratio=full_b / max(field_b, 1), fit_mses=fit_mses,
-             cache_dir=pool_dir, fit_dir=fit_dir, phased_flow=True,
-             low_mem=bool(args.low_mem), base_label=base_label(), profile=profile)
-    print(f"\nFull experts: {full_b / 1e6:.0f} MB -> field: {field_b / 1e6:.0f} MB "
-          f"(x{full_b / field_b:.1f} on experts)", flush=True)
-    print(f"artifact -> {out_dir} ({dir_size_gb(out_dir):.2f} GB) - experts "
-          f"discarded, backbone + field remain: SMALLER than the original Q4 GGUF",
-          flush=True)
+    if "save" in plan:
+        banner("STAGE 6 - building the artifact STREAMINGLY (the full model is not needed)")
+        n_blocks = len(fit_mses)
+        geoms = [torch.load(os.path.join(pool_dir, f"init_blk{i}.pt"),
+                            map_location="cpu")["geom"] for i in range(n_blocks)]
+        if quantized and args.save_backbone == "bf16":
+            sys.exit("--save-backbone bf16 for a bnb source is not supported in the "
+                     "streaming mode: take a GGUF source (it is light anyway)")
+        profile = dict(model=args.model, quant=str(args.gguf_quant), rank=args.rank,
+                       fit_method=args.fit_method, fit_steps=args.fit_steps,
+                       fit_bs=args.fit_bs, fit_lr=args.fit_lr,
+                       fit_jitter=args.fit_jitter, fit_early_stop=args.fit_early_stop,
+                       fit_preset=fit_preset or "none", fit_workers=args.fit_workers,
+                       io_threads=args.io_threads,
+                       prefetch=args.prefetch, io_cache=args.io_cache,
+                       per_layer_cap=args.per_layer_cap)
+        write_field_artifact(src, out_dir, pool_dir, fit_dir, args.rank, dtype,
+                             gguf=light_gguf, profile=profile,
+                             io_workers=args.io_threads, io_cache=args.io_cache)
+        full_b, field_b = field_accounting(geoms, args.rank)
+        T.update(rank=args.rank, full_experts_mb=full_b / 1e6, field_mb=field_b / 1e6,
+                 ratio=full_b / max(field_b, 1), fit_mses=fit_mses,
+                 cache_dir=pool_dir, fit_dir=fit_dir, phased_flow=True,
+                 low_mem=bool(args.low_mem), base_label=base_label(), profile=profile)
+        print(f"\nFull experts: {full_b / 1e6:.0f} MB -> field: {field_b / 1e6:.0f} MB "
+              f"(x{full_b / field_b:.1f} on experts)", flush=True)
+        print(f"artifact -> {out_dir} ({dir_size_gb(out_dir):.2f} GB) - experts "
+              f"discarded, backbone + field remain: SMALLER than the original Q4 GGUF",
+              flush=True)
+    else:
+        print(f"STAGE 6 - save: skipped (--skip save); existing artifact: {out_dir}")
+        T.update(rank=args.rank, fit_mses=fit_mses, low_mem=bool(args.low_mem),
+                 base_label=base_label())
 
-    if not args.skip_reload_check:
+    if "verify" in plan:
         banner("STAGE 7 - verify: the artifact loads as a NORMAL model")
         with open(os.path.join(out_dir, "config.json"), encoding="utf-8") as f:
             art_q = (json.load(f).get("quantization_config") or {}).get("quant_method")
@@ -1032,14 +1246,22 @@ def main():
                 out_dir, dtype=dtype, trust_remote_code=True,
                 low_cpu_mem_usage=True).to(device).eval()
         field_m = eval_vs_cache_disk(art, X, Y, lp_dir)
-        field_gen = generate_text(art, eval_ids, tokenizer,
-                                  n_new=args.gen_tokens,
-                                  repetition_penalty=args.gen_rep_pen)
-        dpct = 100 * (field_m["ppl"] - base_m["ppl"]) / base_m["ppl"]
-        print(f"FIELD (artifact) r={args.rank}: KL {field_m['kl_bits']:.3f} bits/token, "
-              f"ppl {field_m['ppl']:.2f} ({dpct:+.1f}%)", flush=True)
-        print("\nGeneration FROM THE ARTIFACT (same base/prompt as above):\n"
-              + field_gen, flush=True)
+        field_gen = None
+        if args.gen_tokens > 0:
+            field_gen = generate_text(art, eval_ids, tokenizer,
+                                      n_new=args.gen_tokens,
+                                      repetition_penalty=args.gen_rep_pen)
+        if base_m:
+            dpct = 100 * (field_m["ppl"] - base_m["ppl"]) / base_m["ppl"]
+            print(f"FIELD (artifact) r={args.rank}: KL {field_m['kl_bits']:.3f} bits/token, "
+                  f"ppl {field_m['ppl']:.2f} ({dpct:+.1f}%)", flush=True)
+        else:
+            dpct = None
+            print(f"FIELD (artifact) r={args.rank}: KL {field_m['kl_bits']:.3f} bits/token "
+                  f"(base ppl not in this run - no delta)", flush=True)
+        if field_gen:
+            print("\nGeneration FROM THE ARTIFACT (same base/prompt as above):\n"
+                  + field_gen, flush=True)
         print(f"\nInference from the saved artifact: `python3 hf_chat.py` "
               f"(or step2_chat.bat) - it finds the artifact itself", flush=True)
         T.update(base=base_m, field=field_m, ppl_delta=dpct,
@@ -1056,12 +1278,16 @@ def main():
         do_cleanup([deconv_full_dir])
         deconv_full_dir = None
     T["total_seconds"] = round(time.time() - t0, 1)
-    write_report(args, out_dir)
+    if "report" in plan:
+        write_report(args, out_dir)
+    else:
+        print("report skipped (--skip report)", flush=True)
     if args.cleanup:
         do_cleanup(cleanup_targets)
-    print(f"total {T['total_seconds']} s\nartifact: {out_dir}\n"
-          f"report: {out_dir}/README.md + {DL}/moe_hf_pipeline_report.md\n"
-          f"chat: python3 hf_chat.py  (finds the artifact itself)", flush=True)
+    print(f"total {T['total_seconds']} s\nartifact: {out_dir}"
+          + (f"\nreport: {out_dir}/README.md + {DL}/moe_hf_pipeline_report.md"
+             if "report" in plan else "")
+          + f"\nchat: python3 hf_chat.py  (finds the artifact itself)", flush=True)
     print("left on disk:" + "\n" + "\n".join(
         f"  {name}: {dir_size_gb(p):.2f} GB  ({p})"
         for name, p in (("GGUF source", gguf_path),
@@ -1093,6 +1319,10 @@ def write_report(args, out_dir):
                   f"bs {pr.get('fit_bs')}/lr {pr.get('fit_lr')}"
                   f" (preset {pr.get('fit_preset')}) | workers "
                   f"{pr.get('fit_workers')} | prefetch {pr.get('prefetch')}")
+    if T.get("plan"):
+        md.append(f"Stages run: {' -> '.join(T['plan'])}"
+                  + (f" | skipped: {', '.join(T['plan_skipped'])}"
+                     if T.get("plan_skipped") else ""))
     md.append("")
     if T.get("reused_cache"):
         mem = ("Calibration taken from the previous run's cache: the pool of "
@@ -1107,24 +1337,31 @@ def write_report(args, out_dir):
               f"`{T.get('cache_dir', 'results/cache_*')}` - reusable for a new "
               "rank/fit settings without recalibration.")
     md.append("")
-    md.append("## Expert compression")
-    md.append("")
-    md.append("| full experts | field | compression |")
-    md.append("|---|---|---|")
-    md.append(f"| {T['full_experts_mb']:.0f} MB | {T['field_mb']:.0f} MB | "
-              f"x{T['ratio']:.1f} |")
-    md.append("")
-    md.append("Explicit expert weights are NOT stored: centroids + low-rank "
-              "factors U,V + coordinates C (the movement seed is computed from "
-              "the router).")
-    md.append("")
-    md.append(f"Artifact size on disk: **{dir_size_gb(out_dir):.2f} GB** "
-              "(backbone + field). The experts (~12.9 GB fp16 for OLMoE) are "
-              "replaced by the field, so the artifact is smaller than even the "
-              "original Q4 GGUF; inference from it takes RAM roughly the size "
-              "of the artifact + ~1 GB overhead. Recompressing the artifact is "
-              "not needed.")
-    md.append("")
+    if T.get("full_experts_mb") is not None:
+        md.append("## Expert compression")
+        md.append("")
+        md.append("| full experts | field | compression |")
+        md.append("|---|---|---|")
+        md.append(f"| {T['full_experts_mb']:.0f} MB | {T['field_mb']:.0f} MB | "
+                  f"x{T['ratio']:.1f} |")
+        md.append("")
+        md.append("Explicit expert weights are NOT stored: centroids + low-rank "
+                  "factors U,V + coordinates C (the movement seed is computed from "
+                  "the router).")
+        md.append("")
+        md.append(f"Artifact size on disk: **{dir_size_gb(out_dir):.2f} GB** "
+                  "(backbone + field). The experts (~12.9 GB fp16 for OLMoE) are "
+                  "replaced by the field, so the artifact is smaller than even the "
+                  "original Q4 GGUF; inference from it takes RAM roughly the size "
+                  "of the artifact + ~1 GB overhead. Recompressing the artifact is "
+                  "not needed.")
+        md.append("")
+    else:
+        md.append("## Expert compression")
+        md.append("")
+        md.append("Not computed in this run (save stage was skipped; the artifact "
+                  "from the previous run is used as is).")
+        md.append("")
     left = [("GGUF source", T.get("_gguf_path")),
             ("calibration pool cache", T.get("cache_dir")),
             ("field fit", T.get("fit_dir")), ("artifact", out_dir)]
@@ -1151,22 +1388,23 @@ def write_report(args, out_dir):
     md.append("")
     md.append("| variant | ppl | KL vs base, bits/token |")
     md.append("|---|---|---|")
-    md.append(f"| base ({T.get('base_label', 'quantized Q4_K_M (GGUF)')}) | "
-              f"{T['base']['ppl']:.2f} | 0 |")
-    if "field" in T:
+    if T.get("base"):
+        md.append(f"| base ({T.get('base_label', 'quantized Q4_K_M (GGUF)')}) | "
+                  f"{T['base']['ppl']:.2f} | 0 |")
+    if T.get("field"):
         md.append(f"| field r={args.rank} (from the artifact) | {T['field']['ppl']:.2f} | "
                   f"{T['field']['kl_bits']:.3f} (Δppl {T['ppl_delta']:+.1f}%) |")
     else:
-        md.append("| field | metrics skipped (--skip-reload-check) | |")
+        md.append("| field | metrics skipped in this run (--skip verify) | |")
     md.append("")
     md.append("## Generation (greedy, same prompt)")
     md.append("")
     if T.get("gen_base"):
         md.append("**Base:**\n```text\n" + T["gen_base"][:300] + "\n```")
     else:
-        md.append("Base: generation not saved (a cache-only run - the model did "
-                  "not load; see the first run's report for the base sample).")
-    if "gen_field" in T:
+        md.append("Base: generation not saved in this run (cache-only or "
+                  "--gen-tokens 0; see the first run's report for a sample).")
+    if T.get("gen_field"):
         md.append(f"**Field r={args.rank} (generation from the built artifact):**\n"
                   "```text\n" + T["gen_field"][:300] + "\n```")
     md.append("## How to load locally")

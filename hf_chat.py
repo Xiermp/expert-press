@@ -9,16 +9,24 @@ the field). This script loads it and lets you talk to it:
   python3 hf_chat.py --prompt "Hi!"                    # single question, no dialog
   python3 hf_chat.py --temperature 0.8 --max-new 400   # generation settings
   python3 hf_chat.py --repetition-penalty 1.2          # stronger anti-loop
+  python3 hf_chat.py --min-p 0.1                       # long-tail cut (quality)
+
+Quality tip: run temp_calibrate.py once after compression - it fits the
+sampling temperature to the base model's confidence and saves sampling.json
+next to the artifact; this script picks it up automatically.
 
 In-dialog commands:
   /help            - list commands
   /reset           - clear dialog history
   /system <text>   - set/replace the system prompt
-  /temp <x>        - temperature (0 = greedy; default 0.7)
+  /temp <x>        - temperature (0 = greedy; default: sampling.json value
+                     fitted by temp_calibrate.py, else 0.7)
   /rep <x>         - repetition penalty (default 1.15; 1.0 = off). Compressed
                      models have slightly shifted logits and tend to fall
                      into repetition loops under plain decoding - the penalty
                      is the standard first-line fix
+  /minp <x>        - min-p sampling, cuts the long tail (0.05-0.15 tames the
+                     archaic/poetry drift of compressed models; 0 = off)
   /max <n>         - max new tokens per reply
   /exit            - quit
 
@@ -27,6 +35,7 @@ chat_template, the chat falls back to a "Question/Answer" format - coherent,
 but replies match the base model style rather than an assistant.
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -123,6 +132,10 @@ def reply(model, tok, history, system, device, gen_cfg, stream=True):
                   pad_token_id=tok.pad_token_id or tok.eos_token_id)
     if do_sample:
         kwargs.update(temperature=gen_cfg["temp"], top_p=gen_cfg["top_p"])
+        # min-p cuts the long tail (archaic / poetry tokens a compressed model
+        # surfaces too eagerly); 0 = off
+        if gen_cfg.get("minp", 0.0) > 0.0:
+            kwargs["min_p"] = gen_cfg["minp"]
     # compressed models have slightly shifted logits -> plain decoding loops;
     # the standard repetition penalty is the first-line fix (default 1.15)
     if gen_cfg.get("rep", 1.0) != 1.0:
@@ -144,7 +157,8 @@ def reply(model, tok, history, system, device, gen_cfg, stream=True):
     return text, n_new, dt, streamer is not None
 
 
-HELP = """commands: /help  /reset  /system <text>  /temp <x>  /rep <x>  /max <n>  /exit"""
+HELP = ("commands: /help  /reset  /system <text>  /temp <x>  /rep <x>  "
+        "/minp <x>  /max <n>  /exit")
 
 
 def chat_loop(model, tok, device, gen_cfg, system):
@@ -178,6 +192,10 @@ def chat_loop(model, tok, device, gen_cfg, system):
                 gen_cfg["rep"] = float(arg or 1.0)
                 print(f"(repetition penalty={gen_cfg['rep']})", flush=True)
                 continue
+            if cmd == "/minp":
+                gen_cfg["minp"] = max(0.0, float(arg or 0))
+                print(f"(min_p={gen_cfg['minp']})", flush=True)
+                continue
             if cmd == "/max":
                 gen_cfg["max_new"] = int(arg or gen_cfg["max_new"])
                 print(f"(max_new_tokens={gen_cfg['max_new']})", flush=True)
@@ -209,8 +227,13 @@ def main():
     ap.add_argument("--dtype", default="auto",
                     choices=["auto", "bfloat16", "float16", "float32"])
     ap.add_argument("--system", default=None, help="system prompt")
-    ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="sampling temperature; default: sampling.json value "
+                         "fitted by temp_calibrate.py, else 0.7")
     ap.add_argument("--top-p", type=float, default=0.9)
+    ap.add_argument("--min-p", type=float, default=0.0, dest="min_p",
+                    help="min-p sampling (long-tail cut; 0.05-0.15 tames the "
+                         "archaic drift of compressed models; 0 = off)")
     ap.add_argument("--repetition-penalty", type=float, default=1.15,
                     help="repetition penalty (compressed models loop under "
                          "plain decoding; 1.0 = off)")
@@ -220,10 +243,25 @@ def main():
     a = ap.parse_args()
 
     path = pick_model(a.model)
+    # fitted temperature from temp_calibrate.py (artifact folder)
+    fitted = None
+    sj = os.path.join(path, "sampling.json")
+    if os.path.isfile(sj):
+        try:
+            fitted = float(json.load(open(sj, encoding="utf-8")).get("temperature"))
+        except (ValueError, TypeError, OSError):
+            fitted = None
+    if a.temperature is None:
+        a.temperature = fitted if fitted is not None else 0.7
+        src = f"sampling.json (T={a.temperature})" if fitted is not None else "default"
+        print(f"temperature: {a.temperature}  [{src}; override with --temperature]")
+    elif fitted is not None and abs(a.temperature - fitted) > 1e-9:
+        print(f"note: sampling.json has T={fitted}, using your --temperature "
+              f"{a.temperature}", flush=True)
     print("loading model...", flush=True)
     model, tok, device = load_model(path, a.device, a.dtype)
     gen_cfg = dict(temp=max(0.0, a.temperature), top_p=a.top_p, max_new=a.max_new,
-                   rep=a.repetition_penalty)
+                   rep=a.repetition_penalty, minp=max(0.0, a.min_p))
     system = a.system
 
     if a.prompt is not None:                      # single-shot mode

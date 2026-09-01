@@ -57,14 +57,43 @@ def log(msg):
 
 # ------------------------------------------------------------------ download
 
-def resolve_gguf(args):
-    """-> (path to .gguf, human-readable source name)."""
+def gguf_in_cache(repo, gguf_file=None, quant="Q4_K_M"):
+    """Find an already-downloaded .gguf of `repo` in the local HF cache
+    (offline; --skip download / reuse-only mode). -> path or None."""
+    import glob
+    from huggingface_hub.constants import HF_HUB_CACHE
+    root = os.path.join(HF_HUB_CACHE, "models--" + repo.replace("/", "--"),
+                        "snapshots")
+    cands = sorted(glob.glob(os.path.join(root, "*", "*.gguf")))
+    if gguf_file:
+        cands = [c for c in cands if os.path.basename(c) == gguf_file]
+    elif str(quant).lower() != "auto":
+        want = f".{quant}.gguf".lower()
+        cands = [c for c in cands if c.lower().endswith(want)]
+    else:  # auto: best available by the same preference order as online mode
+        cands.sort(key=lambda c: next(
+            (i for i, q in enumerate(QUANT_PREFERENCE)
+             if c.lower().endswith(f".{q.lower()}.gguf")), len(QUANT_PREFERENCE)))
+    return cands[0] if cands else None
+
+
+def resolve_gguf(args, local_only=False):
+    """-> (path to .gguf, human-readable source name).
+    local_only: never hit the network - only an already-downloaded file
+    (local --gguf path or the HF cache) is accepted."""
     if args.gguf:
         p = os.path.abspath(args.gguf)
         if not os.path.isfile(p):
             sys.exit(f"file not found: {p}")
         return p, os.path.basename(p)
     repo = args.repo
+    if local_only:
+        p = gguf_in_cache(repo, gguf_file=args.gguf_file, quant=args.quant)
+        if p is None:
+            sys.exit(f"--skip download: no .gguf of {repo} in the local HF cache\n"
+                     "  -> drop 'download' from --skip, or pass --gguf /path/file.gguf")
+        log(f"local cache hit: {os.path.basename(p)} (no network)")
+        return p, f"{repo}/{os.path.basename(p)} (local cache)"
     from huggingface_hub import HfApi, hf_hub_download
     api = HfApi()
     files = [f for f in api.list_repo_files(repo) if f.endswith(".gguf")]

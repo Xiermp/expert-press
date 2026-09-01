@@ -13,6 +13,21 @@ compressed into the field and quality measured by our protocol (KL bits/token,
 Δppl, compression ratio). No fine-tuning of the base model is required or
 included.
 
+## Documentation
+
+Full docs live in the [wiki/](wiki/) folder:
+
+| page | about |
+|---|---|
+| [wiki/Home.md](wiki/Home.md) | the project card and the ten-minute tour |
+| [wiki/Field-Engine.md](wiki/Field-Engine.md) | the method: formula, what is stored, why it works |
+| [wiki/Pipeline-and-Stages.md](wiki/Pipeline-and-Stages.md) | the 9-stage pipeline and **every stage toggle** |
+| [wiki/Memory-and-Speed.md](wiki/Memory-and-Speed.md) | streaming, `--io-cache ram`, threads, disk layout |
+| [wiki/Quality-and-Calibration.md](wiki/Quality-and-Calibration.md) | the KL protocol, style-drift findings, temperature/min-p fixes |
+| [wiki/Router-Diagnostics.md](wiki/Router-Diagnostics.md) | `router_audit.py` / `router_ft.py` / `field_dims.py` |
+| [wiki/Research-History.md](wiki/Research-History.md) | the experiment ladder with all charts |
+| [wiki/CLI-Reference.md](wiki/CLI-Reference.md) | **every tool, every flag, every default** |
+
 ---
 
 ## Quick start (locally)
@@ -67,6 +82,30 @@ The result lands in `results/field_OLMoE-1B-7B-0924-GGUF_r32/`:
 `config.json`, weights (safetensors), `modeling_field.py`, a `README.md` with
 metrics, plus the combined report `results/moe_hf_pipeline_report.md`.
 
+### Stage toggles: run only what you need
+
+The auto-pipeline is 9 stages (`download → texts → base → calibrate → fit →
+refine → save → verify → report`), and every one of them can be switched
+on/off. The plan is printed before the run and recorded in the report:
+
+```bash
+python3 hf_pipeline.py --list-stages              # the stage table
+python3 hf_pipeline.py --stages fit,save,verify   # run ONLY these (from cache)
+python3 hf_pipeline.py --skip base,verify,report  # run all EXCEPT these
+python3 hf_pipeline.py --skip download            # reuse-only: never touch the network
+python3 hf_pipeline.py --stages fit --rank 64     # a new rank from the cached pool
+python3 hf_pipeline.py --stages refine --refine-rounds 1   # refine standalone
+python3 hf_pipeline.py --gen-tokens 0             # no demo generations
+python3 hf_pipeline.py --no-cache-verify          # skip the 2-chunk cache self-check
+```
+
+Cheap missing stages (`download`, `texts`) are auto-added with a notice;
+expensive missing prerequisites (`base`, `calibrate`, `fit`, `verify`)
+fail fast with a hint instead of surprising you with a multi-hour pass.
+A new rank reuses the calibration pool (it is rank-independent), so
+`--stages fit,save,verify --rank 16` costs only the fit. Full semantics,
+scenarios and the plan behavior: [wiki/Pipeline-and-Stages.md](wiki/Pipeline-and-Stages.md).
+
 Using the result:
 
 ```python
@@ -103,6 +142,38 @@ falls back to a Question/Answer format - coherent, but in the base model's
 style. The artifact also plugs into any app of yours as a normal HF model
 (code above). The artifact is light (~1.2 GB): chat takes ~2 GB of RAM -
 works on a weak machine.
+
+### Quality: taming the style drift (temperature calibration)
+
+Symptom: short replies are fine, but after a couple of turns the model drifts
+into a "neighbour mode" - for OLMoE an archaic / poetry register ("I pray
+thee..."), often with verse-like line breaks. Cause: compression flattens the
+distribution (the measured KL, e.g. 0.757 bits/token); a flattened histogram
+samples long-tail tokens too often, and the drift compounds over the dialog.
+
+First-line fixes, cheapest first:
+
+1. **Temperature calibration** (one scalar, fitted, automatic):
+
+```bash
+python3 temp_calibrate.py --model results/field_xxx \
+    --gguf /content/OLMoE-1B-7B-0924-Q4_K_M.gguf \
+    --calib-file corpus.txt          # the same corpus as during compression
+```
+
+The base model is streamed from the GGUF (never fully loaded); the tool
+minimizes `KL(base || softmax(field/T))` and saves `sampling.json` next to
+the artifact. `hf_chat.py` picks the fitted temperature up automatically
+(`--temperature` / `/temp` still override it). Expect T < 1 for a visibly
+compressed artifact (e.g. 0.6-0.9).
+
+2. **min-p sampling** - cuts the long tail that carries the archaic tokens:
+   `python3 hf_chat.py --min-p 0.1` (or `/minp 0.1` in-dialog; 0 = off).
+
+3. **Greedy test** - `/temp 0`: if greedy output is clean, the drift is a
+   sampling problem (fixes 1-2 are enough); if greedy still drifts, the
+   error is structural -> audit the router (`router_audit.py`), then
+   consider per-depth rank reallocation or gate calibration (`router_ft.py`).
 
 ---
 
@@ -437,7 +508,11 @@ see `modeling_field.py`).
 | `hf_gguf_to_hf.py` | Q4 GGUF download + dequant into a plain HF checkpoint (olmoe, hy_v3) |
 | `hf_stream.py` | streaming runner: backbone in RAM, experts per block, background prefetch, optional raw-GGUF RAM cache (`--io-cache ram`) |
 | `hf_field_transform.py` | the core: calibration (disk cache), field fit (several methods), deploy, metrics |
-| `hf_chat.py` | chat with the transformed model in a terminal (streaming output, commands) |
+| `hf_chat.py` | chat with the transformed model in a terminal (streaming output, commands, auto temperature from `sampling.json`, min-p) |
+| `temp_calibrate.py` | fits the sampling temperature to the base model's confidence (streamed base vs artifact; writes `sampling.json`) |
+| `router_audit.py` | per-layer router audit of an artifact (drift, load balance, z-scramble) -> JSON |
+| `router_ft.py` | surgical gate calibration: gate-only KL fit, anchored; saves `<artifact>_rft` on improvement |
+| `field_dims.py` | artifact accounting one-liner (dims, params, field mix, bytes) |
 | `hf_env.py` | redirects the HF cache into the project (imported first) |
 | `modeling_field_template.py` | the template of the artifact's modeling code |
 | `step1_compress.bat` / `step2_chat.bat` | double-click launchers on Windows |
@@ -445,6 +520,7 @@ see `modeling_field.py`).
 | `test_stream_mode.py`, `test_gguf_direct.py`, `test_field_fit_guard.py`, `test_io_cache.py`, `test_io_cache_stream.py` | A/B tests (bit-exact streaming vs full model; GGUF vs checkpoint; fit guard; `--io-cache ram` correctness) |
 | `run_pipeline.sh` + `pipeline.py`, `common.py`, `train.py`, `transform_eval.py`, `variants_eval.py`, `upgrade_eval.py`, `bank_eval.py`, `masks_eval.py`, `field_eval.py`, `deploy.py`, `verify_transformed.py` | toy pipeline: trains a mini-MoE, compresses it, compares against baselines (SVD/PQ/BitDelta/dense) |
 | `examples/toy_report/` | mini-PoC reports and numbers |
+| `wiki/` | the project wiki (method, pipeline, quality findings, research history with charts, CLI reference) |
 
 ## Environment check without big downloads
 
