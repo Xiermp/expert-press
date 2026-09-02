@@ -1,7 +1,7 @@
 From 643ea3309d2df951dabba32bdd26384223d9eacf Mon Sep 17 00:00:00 2001
 From: Super Z <dev@local>
 Date: Tue, 1 Sep 2026 14:44:09 +0000
-Subject: [PATCH 1/3] Add --io-cache ram: process-wide raw-GGUF tensor cache
+Subject: [PATCH 1/7] Add --io-cache ram: process-wide raw-GGUF tensor cache
  for slow storage
 
 On Colab/Drive/HDD the streaming passes re-read the packed expert tensors
@@ -479,7 +479,7 @@ index 0000000..cc5dbcc
 From a22303998653989a24bc88686f6998130d199d48 Mon Sep 17 00:00:00 2001
 From: Super Z <dev@local>
 Date: Tue, 1 Sep 2026 16:12:10 +0000
-Subject: [PATCH 2/3] Add temperature calibration + min-p sampling for
+Subject: [PATCH 2/7] Add temperature calibration + min-p sampling for
  generation quality
 
 Field compression flattens the output distribution (KL ~0.76 bits/token on
@@ -911,7 +911,7 @@ index 0000000..3f56145
 From fa1cc8053ad7c9faee070c5f460001b9a3198865 Mon Sep 17 00:00:00 2001
 From: Z User <z@container>
 Date: Tue, 1 Sep 2026 16:49:45 +0000
-Subject: [PATCH 3/3] Add project wiki, router diagnostic tools, and pipeline
+Subject: [PATCH 3/7] Add project wiki, router diagnostic tools, and pipeline
  stage toggles
 
 - wiki/: 8-page project wiki (method, pipeline+stage toggles, memory/speed,
@@ -19199,6 +19199,944 @@ YYTaD3@0Mka^qU(SnCPFHyyWly4~+dOhX4Qo
 literal 0
 HcmV?d00001
 
+-- 
+2.47.3
+
+
+From 02ac3f309b2c31a0b46c2de761f16948a1ad6cc4 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Tue, 1 Sep 2026 19:12:52 +0000
+Subject: [PATCH 4/7] Colab-ready: hardware profile (--profile auto|low|high),
+ CUDA device fix, Drive-cache notebook
+
+- hf_pipeline.py: apply_hardware_profile + check_io_cache_fit; auto lifts
+  conservative defaults on strong hardware (io-cache ram, io-threads 4,
+  calib-bsz 16 on GPU, fp16 on pre-Ampere GPUs like T4); explicit flags win;
+  low = classic weak-box behavior 1:1
+- hf_field_transform.py: _mdev() device guard in 5 entry points - fixes
+  'index on cpu vs cuda:0' when streaming on GPU
+- hf_env.py: MOE_HF_CACHE override (HF_HOME stays respected)
+- moe_router_colab.ipynb (NEW): Drive-cached end-to-end run - HF_HOME on
+  Drive, GGUF once, calibration pool synced, artifact to Drive
+- wiki: Colab.md (NEW), Home/Memory/CLI-Reference updated
+---
+ README.md                |  18 +++++-
+ hf_env.py                |   4 +-
+ hf_field_transform.py    |  42 ++++++++++----
+ hf_pipeline.py           | 122 +++++++++++++++++++++++++++++++++++++--
+ moe_router_colab.ipynb   |  97 +++++++++++++++++++++++++++++++
+ wiki/CLI-Reference.md    |   7 ++-
+ wiki/Colab.md            |  75 ++++++++++++++++++++++++
+ wiki/Home.md             |   1 +
+ wiki/Memory-and-Speed.md |  27 ++++++++-
+ 9 files changed, 369 insertions(+), 24 deletions(-)
+ create mode 100644 moe_router_colab.ipynb
+ create mode 100644 wiki/Colab.md
+
+diff --git a/README.md b/README.md
+index a5dfd77..2905791 100644
+--- a/README.md
++++ b/README.md
+@@ -344,7 +344,8 @@ Implemented optimizations:
+ - `--prefetch 1` (default) - a background thread dequantizes the NEXT expert
+   block while the current layer computes. `--prefetch 0` - synchronous
+   (+~1 block of RAM saved).
+-- `--io-cache ram` (default `disk`) - copies the RAW PACKED GGUF tensors into
++- `--io-cache ram` (default: auto - `ram` when enough free RAM, else `disk`) -
++  copies the RAW PACKED GGUF tensors into
+   RAM on first touch (lazily, tensor by tensor; total ~= the packed file
+   size, e.g. ~2.7 GB for a 1B Q8_0 MoE). The cache is process-wide and shared
+   by every streaming pass, so the calibration-pool collection, a refit pass
+@@ -354,9 +355,24 @@ Implemented optimizations:
+   file read replaces thousands of small random ones. On a machine where RAM
+   is too tight even for the packed file, stay on `disk` (prefetch +
+   io-threads still help).
++- `--profile auto|low|high` (default `auto`) - the weak-PC limits are lifted
++  automatically on stronger hardware: CUDA present (or >= 32 GB RAM + >= 8
++  cores) -> `high`: io-cache ram, io-threads 4, calib-bsz 16 on GPU, and
++  fp16 on pre-Ampere GPUs (a T4 has no native bf16). `low` (or `--low-mem`)
++  keeps the historical behavior, so 8 GB machines are unaffected. The
++  resolved profile is printed in the `hardware:` line at startup.
++- GPU: `--device auto` runs the whole streaming path on cuda:0 when a GPU is
++  present (backbone + one expert block in VRAM at a time); the fit uses it
++  as before.
+ - The pool cache makes re-runs (new rank, new fit settings) skip stages 1-4
+   entirely.
+ 
++Google Colab: the ready notebook `moe_router_colab.ipynb` (in this folder)
++does the full loop - T4 GPU runtime, GGUF downloaded ONCE into an HF cache
++on Drive (`HF_HOME` -> Drive), pool cache and artifact synced to Drive, so a
++reconnect skips the download and stages 1-4 entirely. Same plain
++`hf_pipeline.py` command inside, no adaptation. Details: `wiki/Colab.md`.
++
+ Colab note: put the GGUF on the LOCAL disk (`/content`), not a Drive mount -
+ a Drive FUSE mount turns every small read into a network round-trip. Then
+ `--io-cache ram --io-threads 2-4` on a standard Colab VM (12.7 GB RAM) fits
+diff --git a/hf_env.py b/hf_env.py
+index bbb02df..1cd2933 100644
+--- a/hf_env.py
++++ b/hf_env.py
+@@ -14,7 +14,9 @@ If HF_HOME/HF_HUB_CACHE are set manually BEFORE the run, they are kept
+ import os
+ 
+ ROOT = os.path.dirname(os.path.abspath(__file__))
+-CACHE = os.path.join(ROOT, "hf_cache")
++# MOE_HF_CACHE - explicit project override; an already-set HF_HOME still wins
++# (e.g. a Drive path exported by the Colab notebook before the import)
++CACHE = os.environ.get("MOE_HF_CACHE") or os.path.join(ROOT, "hf_cache")
+ 
+ 
+ def apply() -> str:
+diff --git a/hf_field_transform.py b/hf_field_transform.py
+index 0e16594..8e987ac 100644
+--- a/hf_field_transform.py
++++ b/hf_field_transform.py
+@@ -27,6 +27,19 @@ TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+ FIT_METHODS = ("adam", "adamw", "adam-cosine", "rmsprop")
+ 
+ 
++def _mdev(model):
++    """Device of the model's weights. Works for a plain HF model, a bnb
++    (device_map) model and BlockStreamRunner (it exposes .device and also
++    delegates attribute lookups to the wrapped model)."""
++    d = getattr(model, "device", None)
++    if isinstance(d, torch.device):
++        return d
++    try:
++        return next(model.parameters()).device
++    except StopIteration:
++        return torch.device("cpu")
++
++
+ # ---------------------------------------------------------------- quantization
+ 
+ def dequant_weight(w):
+@@ -580,15 +593,16 @@ def eval_logits_cache_disk(model, ids, ctx, n_chunks, lp_dir, seed=17):
+     (cheap); the log-prob caches themselves live on disk."""
+     os.makedirs(lp_dir, exist_ok=True)
+     model.eval()
++    dev = _mdev(model)
+     g = torch.Generator().manual_seed(seed)
+     X, Y = [], []
+     for i in range(n_chunks):
+         s = int(torch.randint(0, len(ids) - ctx - 1, (1,), generator=g))
+-        x = ids[s:s + ctx].unsqueeze(0)
+-        logits = model(input_ids=x).logits[0]
++        xc = ids[s:s + ctx]          # stays on CPU: it is cached in eval_tokens.pt
++        logits = model(input_ids=xc.unsqueeze(0).to(dev)).logits[0]
+         lp = torch.log_softmax(logits, dim=-1).to(torch.bfloat16).cpu()
+         torch.save(lp, os.path.join(lp_dir, f"lp_{i:03d}.pt"))
+-        X.append(x[0])
++        X.append(xc)
+         Y.append(ids[s + 1:s + ctx + 1])
+     return X, Y
+ 
+@@ -599,19 +613,22 @@ def eval_vs_cache_disk(model, X, Y, lp_dir, n_max=None):
+     n_max - verify only the first n chunks (for the base the cache is its own:
+     a full check of all chunks = wasted model passes, expensive in streaming)."""
+     model.eval()
++    dev = _mdev(model)
+     ces, kls = [], []
+     pairs = list(zip(X, Y))
+     if n_max:
+         pairs = pairs[:n_max]
+     for i, (x, y) in enumerate(pairs):
+         lp = torch.load(os.path.join(lp_dir, f"lp_{i:03d}.pt"), map_location="cpu")
+-        logits = model(input_ids=x.unsqueeze(0)).logits[0]
++        logits = model(input_ids=x.unsqueeze(0).to(dev)).logits[0]
+         # ppl computed the SAME way as the base ppl from the cache: gather from
+         # bf16 log_softmax. An identical-to-base model then gives a delta ppl
+         # of exactly 0.0 (no systematic float32-CE vs bf16-cache shift).
+         lp_q = torch.log_softmax(logits, dim=-1).to(torch.bfloat16)
++        y = y.to(lp_q.device)
+         ces.append(float(-(lp_q.gather(1, y.unsqueeze(1))[:, 0]).float().mean()))
+         lq = torch.log_softmax(logits.float(), dim=-1)
++        lp = lp.to(lq.device)
+         p = lp.float().exp()
+         kls.append(float((p * (lp.float() - lq)).sum(-1).mean()))
+         del lp
+@@ -640,14 +657,15 @@ def base_metrics_from_cache(lp_dir, X, Y):
+ def eval_logits_cache(model, ids, ctx, n_chunks, seed=17):
+     """Base-model log-probs on fixed chunks (cache for KL after the swap)."""
+     model.eval()
++    dev = _mdev(model)
+     g = torch.Generator().manual_seed(seed)
+     X, Y, LP = [], [], []
+     for _ in range(n_chunks):
+         s = int(torch.randint(0, len(ids) - ctx - 1, (1,), generator=g))
+-        x = ids[s:s + ctx].unsqueeze(0)
+-        logits = model(input_ids=x).logits[0]
++        xc = ids[s:s + ctx]
++        logits = model(input_ids=xc.unsqueeze(0).to(dev)).logits[0]
+         LP.append(torch.log_softmax(logits, dim=-1).to(torch.bfloat16).cpu())
+-        X.append(x[0])
++        X.append(xc)
+         Y.append(ids[s + 1:s + ctx + 1])
+     return X, Y, LP
+ 
+@@ -656,11 +674,13 @@ def eval_logits_cache(model, ids, ctx, n_chunks, seed=17):
+ def eval_vs_cache(model, X, Y, LP):
+     """CE/KL of the converted model against the base log-prob cache."""
+     model.eval()
++    dev = _mdev(model)
+     ces, kls = [], []
+     for x, y, lp in zip(X, Y, LP):
+-        logits = model(input_ids=x.unsqueeze(0)).logits[0]
++        logits = model(input_ids=x.unsqueeze(0).to(dev)).logits[0]
+         lq = torch.log_softmax(logits.float(), dim=-1)
+-        ces.append(F.cross_entropy(logits.float(), y).item())
++        ces.append(F.cross_entropy(logits.float(), y.to(logits.device)).item())
++        lp = lp.to(logits.device)
+         p = lp.float().exp()
+         kls.append(float((p * (lp.float() - lq)).sum(-1).mean()))
+     ce = sum(ces) / len(ces)
+@@ -673,7 +693,7 @@ def generate_text(model, ids, tokenizer, n_prompt=12, n_new=48, seed=3,
+                   repetition_penalty=1.0):
+     g = torch.Generator().manual_seed(seed)
+     s = int(torch.randint(0, len(ids) - n_prompt - 1, (1,), generator=g))
+-    prompt = ids[s:s + n_prompt].unsqueeze(0)
++    prompt = ids[s:s + n_prompt].unsqueeze(0).to(_mdev(model))
+     kwargs = dict(max_new_tokens=n_new, do_sample=False)
+     # compressed models have slightly shifted logits - plain greedy decoding
+     # is the worst case for degenerate repetition loops; a standard
+@@ -682,7 +702,7 @@ def generate_text(model, ids, tokenizer, n_prompt=12, n_new=48, seed=3,
+     if repetition_penalty and repetition_penalty != 1.0:
+         kwargs["repetition_penalty"] = repetition_penalty
+     out = model.generate(prompt, **kwargs)
+-    return tokenizer.decode(out[0])
++    return tokenizer.decode(out[0].cpu())
+ 
+ 
+ # ------------------------------------------------------------------ saving
+diff --git a/hf_pipeline.py b/hf_pipeline.py
+index 093b6ac..3ad4c10 100644
+--- a/hf_pipeline.py
++++ b/hf_pipeline.py
+@@ -432,9 +432,105 @@ def ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, min_pairs):
+     return plan
+ 
+ 
++def ram_gb(available=False):
++    """GB of RAM (available/total); best effort - never raises."""
++    try:
++        import psutil
++        vm = psutil.virtual_memory()
++        return (vm.available if available else vm.total) / 1e9
++    except Exception:
++        pass
++    try:
++        with open("/proc/meminfo") as f:
++            info = {}
++            for line in f:
++                if ":" in line:
++                    k, v = line.split(":", 1)
++                    info[k] = int(v.strip().split()[0]) * 1024
++        total = info.get("MemTotal", 0)
++        avail = info.get("MemAvailable", total)
++        return (avail if available else total) / 1e9
++    except Exception:
++        return 8.0
++
++
++def _cuda_ok():
++    """Cheap CUDA probe that works before the bootstrap stage."""
++    if os.environ.get("CUDA_VISIBLE_DEVICES") == "":
++        return False
++    try:
++        import torch
++        return bool(torch.cuda.is_available())
++    except Exception:
++        return False
++
++
++def apply_hardware_profile(args, device):
++    """--profile auto|low|high: lift the conservative defaults on strong
++    hardware, keep them 1:1 on a weak box. Explicit flags always win: only
++    values still at their None placeholder are auto-filled."""
++    cuda = (device == "cuda")
++    total_gb, cores = ram_gb(), (os.cpu_count() or 1)
++    if getattr(args, "profile", "auto") == "auto":
++        args.profile = "high" if (cuda or (total_gb >= 32 and cores >= 8)) else "low"
++    high = (args.profile == "high")
++    low_mem = getattr(args, "low_mem", False)
++    if getattr(args, "io_cache", None) is None:
++        args.io_cache = "ram" if (high and not low_mem) else "disk"
++        args._io_cache_auto = True
++    if getattr(args, "io_threads", None) is None:
++        args.io_threads = 4 if high else 1
++    bsz16 = (high and cuda and not low_mem)
++    if getattr(args, "calib_bsz", None) is None:
++        args.calib_bsz = 16 if bsz16 else 8
++    elif bsz16 and args.calib_bsz == 8:
++        args.calib_bsz = 16
++    if high and cuda and not low_mem:
++        if getattr(args, "dtype", "auto") == "auto":
++            try:
++                import torch
++                if tuple(torch.cuda.get_device_capability()) < (8, 0):
++                    args.dtype = "float16"   # bf16 needs sm_80+ (T4 = sm_75)
++                    print("[profile] pre-Ampere GPU: dtype auto -> float16 "
++                          "(no native bfloat16)", flush=True)
++            except Exception:
++                pass
++    print(f"[profile] {args.profile} (device={device}, ram={total_gb:.0f} GB, "
++          f"cores={cores}) -> io-cache={args.io_cache}, "
++          f"io-threads={args.io_threads}, calib-bsz={args.calib_bsz}"
++          + (f", dtype={args.dtype}" if getattr(args, "dtype", "auto") != "auto"
++             else ""), flush=True)
++
++
++def check_io_cache_fit(args, gguf_path):
++    """io-cache ram needs the GGUF (+ dequant headroom) in free RAM; an
++    auto-selected ram cache downgrades to disk when it does not fit, an
++    explicit one only warns."""
++    if getattr(args, "io_cache", None) != "ram" or not gguf_path:
++        return
++    try:
++        size_gb = os.path.getsize(gguf_path) / 1e9
++    except OSError:
++        return
++    avail = ram_gb(available=True)
++    if avail >= max(size_gb * 2.0, 4.0):
++        return
++    if getattr(args, "_io_cache_auto", False):
++        print(f"[profile] io-cache ram: {avail:.1f} GB free is too tight for a "
++              f"{size_gb:.1f} GB GGUF (+headroom) -> falling back to disk",
++              flush=True)
++        args.io_cache = "disk"
++    else:
++        print(f"[profile] WARNING: io-cache ram may not fit ({size_gb:.1f} GB "
++              f"GGUF, {avail:.1f} GB free) - kept as explicitly requested",
++              flush=True)
++
++
+ def print_profile(args, fit, preset):
+     """One place to see everything the run will actually use."""
+     rows = [
++        ("profile", args.profile),
++        ("io_cache", args.io_cache),
+         ("model", args.model),
+         ("quant", "auto" if str(args.gguf_quant).lower() == "auto" else args.gguf_quant),
+         ("rank", args.rank),
+@@ -482,13 +578,22 @@ def main():
+     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+     ap.add_argument("--dtype", default="auto",
+                     choices=["auto", "bfloat16", "float16", "float32"])
++    ap.add_argument("--profile", default="auto", choices=["auto", "low", "high"],
++                    help="hardware profile: auto detects it (CUDA, or 32 GB+ RAM "
++                         "and 8+ cores -> high, else low); high lifts the "
++                         "conservative defaults on a strong box (io-cache ram, "
++                         "io-threads 4, calib-bsz 16 on GPU, fp16 on pre-Ampere "
++                         "GPUs); low = the classic cautious defaults. Explicit "
++                         "--io-cache/--io-threads/--calib-bsz/--dtype always win")
+     ap.add_argument("--calib-file", default=None)
+     ap.add_argument("--eval-file", default=None)
+     ap.add_argument("--calib-dataset", default=None,
+                     help="e.g. wikitext-2-raw-v1 (requires datasets)")
+     ap.add_argument("--text-cap", type=int, default=3_000_000, help="text characters")
+     ap.add_argument("--calib-windows", type=int, default=3)
+-    ap.add_argument("--calib-bsz", type=int, default=8)
++    ap.add_argument("--calib-bsz", type=int, default=None,
++                    help="calibration batch size (default: 8, or 16 on a GPU "
++                         "under the high profile)")
+     ap.add_argument("--calib-ctx", type=int, default=512)
+     ap.add_argument("--per-layer-cap", type=int, default=8192)
+     ap.add_argument("--fit-steps", type=int, default=None,
+@@ -523,19 +628,21 @@ def main():
+                          "targets, then a warm-started refit. Fixes the compounding "
+                          "error the first fit cannot see (it is calibrated on the "
+                          "BASE model's activations)")
+-    ap.add_argument("--io-threads", type=int, default=1,
++    ap.add_argument("--io-threads", type=int, default=None,
+                     help="threads for GGUF dequant of expert tensors (2-4 speeds "
+                          "up stage 3-4/6 block reads on a multi-core CPU; "
+-                         "1 = single-threaded)")
++                         "default: 1, or 4 under the high profile)")
+     ap.add_argument("--prefetch", type=int, default=1,
+                     help="background prefetch of the next expert block while the "
+                          "current layer computes (default 1; 0 = off, saves ~1 "
+                          "block of RAM)")
+-    ap.add_argument("--io-cache", choices=["disk", "ram"], default="disk",
++    ap.add_argument("--io-cache", choices=["disk", "ram"], default=None,
+                     help="ram: copy the packed GGUF tensors into RAM on first "
+                          "touch (~= packed file size); later passes (pool "
+                          "collection, refit, artifact write) read nothing from "
+-                         "disk - big win on Colab/Drive or HDD")
++                         "disk - big win on Colab/Drive or HDD (default: auto - "
++                         "disk, or ram under the high profile when the GGUF "
++                         "fits in free RAM)")
+     ap.add_argument("--eval-chunks", type=int, default=50)
+     ap.add_argument("--kl-chunks", type=int, default=16)
+     ap.add_argument("--eval-ctx", type=int, default=512)
+@@ -585,6 +692,9 @@ def main():
+                     help="mini wiring run: short fit/eval")
+     args = ap.parse_args()
+     plan = resolve_plan(args)          # may exit (--list-stages / bad names)
++    device_hint = "cuda" if (args.device == "cuda"
++                             or (args.device == "auto" and _cuda_ok())) else "cpu"
++    apply_hardware_profile(args, device_hint)
+     if args.smoke:
+         args.calib_windows, args.calib_bsz, args.calib_ctx = 2, 2, 128
+         args.per_layer_cap, args.fit_steps, args.fit_bs = 2048, 60, 2048
+@@ -637,6 +747,7 @@ def main():
+     else:
+         dtype = getattr(torch, args.dtype)
+     T["device"], T["dtype"] = str(device), str(dtype)
++    T["profile"], T["io_cache"] = args.profile, args.io_cache
+ 
+     def base_label():
+         sq = str(T.get("source_quant", "none"))
+@@ -679,6 +790,7 @@ def main():
+         T["source_quant"] = f"gguf:{args.gguf_quant}"
+         print(f"source: {src_name} "
+               f"({os.path.getsize(gguf_path) / 1e9:.2f} GB)", flush=True)
++        check_io_cache_fit(args, gguf_path)
+         conv_dir = args.gguf_out or os.path.join(
+             DL, "gguf_hf", os.path.basename(gguf_path).removesuffix(".gguf") + "-hf")
+         if args.full_dequant:
+diff --git a/moe_router_colab.ipynb b/moe_router_colab.ipynb
+new file mode 100644
+index 0000000..6703bab
+--- /dev/null
++++ b/moe_router_colab.ipynb
+@@ -0,0 +1,97 @@
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": "# Field Engine в Google Colab\n\nСжимает MoE-модель (OLMoE-1B-7B) в «полевой» артефакт: эксперты не хранятся,\nсобираются на лету из low-rank поля по роутеру. Подробнее — `wiki/Home.md`.\n\n**Как запустить**\n1. `Среда выполнения → Сменить среду выполнения → T4 GPU` (бесплатного тарифа хватает; GPU включится автоматически: пайплайн сам перейдёт на fp16 на T4 и включит GPU-стриминг).\n2. Один раз загрузите `expert-press-update.zip` в корень Google Drive.\n3. Выполните ячейки по порядку (Shift+Enter).\n\n**Что происходит с докачкой:** все загрузки оседают на Google Drive\n(`HF_HOME` → Drive) — модель скачивается **один раз**, дальше каждая сессия\nтолько копирует файл с Drive на локальный диск (~1–2 мин) и восстанавливает\nкеш калибровки, после чего стадии 1–4 пайплайна пропускаются целиком.\nКод пайплайна — обычный питон, никакой адаптации: ноутбук просто его запускает."
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": "import glob, os, shutil, zipfile\nfrom google.colab import drive\n\nif not os.path.isdir(\"/content/drive/MyDrive\"):\n    drive.mount(\"/content/drive\")\n\nPROJ = \"/content/expert-press-update\"\nif not os.path.isfile(f\"{PROJ}/hf_pipeline.py\"):\n    zips = [\"/content/expert-press-update.zip\",\n            *glob.glob(\"/content/drive/MyDrive/**/expert-press-update.zip\",\n                       recursive=True)]\n    assert zips and os.path.isfile(zips[0]), (\n        \"загрузите expert-press-update.zip в Google Drive (или в /content) \"\n        \"и перезапустите ячейку\")\n    print(\"unzipping:\", zips[0])\n    with zipfile.ZipFile(zips[0]) as z:\n        z.extractall(\"/content\")\n    assert os.path.isfile(f\"{PROJ}/hf_pipeline.py\"), \"hf_pipeline.py не найден\"\nos.chdir(PROJ)\n\ngpu = os.popen(\"nvidia-smi --query-gpu=name,memory.total \"\n               \"--format=csv,noheader 2>/dev/null\").read().strip()\nprint(\"project:\", PROJ)\nprint(\"GPU:\", gpu if gpu else\n      \"НЕ НАЙДЕН -> Runtime > Change runtime type > T4 GPU, затем Restart\")"
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": "## 1. Пути и кеши\n\n`HF_HOME` на Drive — это и есть главный выключатель повторных докачек: всё,\nчто когда-либо скачал Hugging Face, остаётся там между сессиями. Рабочая\nпапка пайплайна (`MOE_OUT_DIR`) — на локальном диске: быстрые случайные\nчтения, а ценное (пул калибровки, артефакт) ячейка 5 синхронизирует на Drive."
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": "import os, pathlib\n\n# ============================ НАСТРОЙКИ ==================================\nREPO       = \"mradermacher/OLMoE-1B-7B-0924-GGUF\"  # GGUF-репозиторий\nQUANT      = \"Q4_K_M\"       # какой квант качать (Q4_K_M | Q4_K_S | Q8_0 ...)\nGGUF_FILE  = None           # точное имя файла, напр. \"OLMoE-1B-7B-0924.Q4_K_M.gguf\"\nRANK       = 32             # ранг поля (16/32/64)\nFIT_PRESET = None           # None | \"fast\" | \"balanced\" | \"quality\"\n# =========================================================================\n\nDRIVE_MOE  = \"/content/drive/MyDrive/moe_router\"  # постоянное хранилище\nHF_CACHE   = f\"{DRIVE_MOE}/hf_cache\"              # кеш HF hub - живет между сессиями\nRUN_DIR    = \"/content/run\"                       # рабочая папка (быстрый локальный диск)\nGGUF_LOCAL = \"/content/gguf_cache\"                # локальная копия GGUF для быстрых чтений\n\nos.environ[\"HF_HOME\"]     = HF_CACHE\nos.environ[\"MOE_OUT_DIR\"] = RUN_DIR\nfor d in (HF_CACHE, RUN_DIR, GGUF_LOCAL, f\"{DRIVE_MOE}/gguf\",\n          f\"{DRIVE_MOE}/pool_cache\", f\"{DRIVE_MOE}/artifacts\"):\n    pathlib.Path(d).mkdir(parents=True, exist_ok=True)\nprint(\"HF_HOME     ->\", HF_CACHE)\nprint(\"MOE_OUT_DIR ->\", RUN_DIR)"
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": "## 2. Модель: скачивается один раз, потом только с Drive\n\nПервый запуск кладёт GGUF в кеш на Drive (~4.4 ГБ, единственная большая\nдокачка). Каждая следующая сессия: файл найден в кеше → копируется на\nлокальный диск (быстрые чтения при стриминге) → сеть не трогается вовсе."
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": "import glob, os, shutil\nfrom huggingface_hub import HfApi, hf_hub_download\n\ndef drive_ggufs():\n    return sorted(glob.glob(f\"{DRIVE_MOE}/gguf/*.gguf\")\n                  + glob.glob(f\"{HF_CACHE}/hub/models--*/snapshots/*/*.gguf\"))\n\nfiles = drive_ggufs()\nif not files:\n    print(\"первый запуск: скачиваю GGUF один раз -> кеш на Drive ...\")\n    fl = [f for f in HfApi().list_repo_files(REPO) if f.endswith(\".gguf\")]\n    name = GGUF_FILE or next(\n        (f for f in sorted(fl) if f.lower().endswith(f\".{QUANT.lower()}.gguf\")), None)\n    assert name, f\"в {REPO} нет .{QUANT}.gguf; доступно: {sorted(fl)}\"\n    print(\"file:\", name)\n    hf_hub_download(REPO, name)          # -> HF_HOME (Drive)\n    files = drive_ggufs()\n    assert files, \"скачивание завершилось, но кеш пуст - проверьте HF_HOME\"\n\ndef wanted(path):\n    if GGUF_FILE:\n        return os.path.basename(path) == GGUF_FILE\n    return path.lower().endswith(f\".{QUANT.lower()}.gguf\")\n\nsrc = next((f for f in files if wanted(f)), None)\nassert src, f\"подходящий GGUF не найден среди {[os.path.basename(f) for f in files]}\"\nGGUF_PATH = f\"{GGUF_LOCAL}/{os.path.basename(src)}\"\nif not os.path.isfile(GGUF_PATH):\n    print(f\"Drive -> локальный диск (быстрые чтения): {os.path.basename(src)}\")\n    shutil.copyfile(src, GGUF_PATH)\nprint(\"GGUF готов:\", GGUF_PATH, f\"({os.path.getsize(GGUF_PATH)/1e9:.2f} GB)\")"
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": "## 3. Кеш калибровки: с Drive → локальный диск\n\nПул пар (стадии 3–4, самый медленный стриминг) сохраняется на Drive. Если он\nуже собран — эта ячейка восстанавливает его локально, и пайплайн пропускает\nстадии 1–4 целиком (сам напишет `no streaming pass needed`)."
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": "import os, re, shutil\n\nTAG = re.sub(r\"[^A-Za-z0-9_.-]\", \"_\", os.path.basename(GGUF_PATH))[:60]\nPOOL      = f\"{RUN_DIR}/cache_{TAG}\"\nPOOL_DRVE = f\"{DRIVE_MOE}/pool_cache/cache_{TAG}\"\n\nif os.path.isdir(POOL):\n    print(\"пул уже на локальном диске:\", POOL)\nelif os.path.isdir(POOL_DRVE):\n    print(\"восстанавливаю пул калибровки с Drive (стадии 3-4 будут пропущены)...\")\n    shutil.copytree(POOL_DRVE, POOL)\nelse:\n    print(\"пула ещё нет - первый запуск соберёт его (медленный стриминг); \"\n          \"ячейка 5 закинет его на Drive для следующих сессий\")"
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": "## 4. Запуск сжатия\n\nОбычный запуск пайплайна — без спец-адаптаций. `--device auto` включает GPU\n(на T4 профиль сам переключит dtype в fp16, включит io-cache ram и\nio-threads 4 — строка `hardware:` в начале лога покажет, что выбрано).\nПовторный запуск с готовым пулом пробегает только fit/save/verify."
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": "CMD = f\"python hf_pipeline.py --gguf {GGUF_PATH} --rank {RANK} --device auto\"\nif FIT_PRESET:\n    CMD += f\" --fit-preset {FIT_PRESET}\"\nprint(CMD, flush=True)\n\n!{CMD}"
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": "## 5. Синхронизация: пул и артефакт → Drive\n\nАртефакт (`field_*_r*` — компактная модель) и пул калибровки сохраняются на\nDrive: после перезапуска среды ничего пересобирать не нужно."
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": "import os, shutil\n\nif os.path.isdir(POOL):\n    print(\"пул калибровки -> Drive ...\")\n    shutil.copytree(POOL, POOL_DRVE, dirs_exist_ok=True)\n\nART = f\"{RUN_DIR}/field_{TAG}_r{RANK}\"\nif os.path.isdir(ART):\n    dst = f\"{DRIVE_MOE}/artifacts/{os.path.basename(ART)}\"\n    if not os.path.isdir(dst):\n        print(\"артефакт -> Drive:\", dst)\n        shutil.copytree(ART, dst)\nprint(\"готово. следующая сессия переиспользует: модель (HF-кеш), пул, артефакт\")"
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": "## Заметки\n\n- **Память.** Если словили OOM на T4-классической машине — добавьте к команде\n  `--io-cache disk` (авто-выбор ram будет понижен автоматически, но явный\n  флаг полезен как страховка).\n- **Поболтать с артефактом:** `!python hf_chat.py --model {ART} --device auto`.\n- **Новый ранг из готового пула:** поменяйте `RANK` в ячейке 1 и повторите\n  шаги 4–5 — пул переиспользуется, заново стримить модель не нужно.\n- Что качается и когда: `wiki/Colab.md`."
++  }
++ ],
++ "metadata": {
++  "accelerator": "GPU",
++  "colab": {
++   "gpuType": "T4",
++   "provenance": []
++  },
++  "kernelspec": {
++   "name": "python3",
++   "display_name": "Python 3"
++  },
++  "language_info": {
++   "name": "python"
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 0
++}
+\ No newline at end of file
+diff --git a/wiki/CLI-Reference.md b/wiki/CLI-Reference.md
+index 727025d..b840435 100644
+--- a/wiki/CLI-Reference.md
++++ b/wiki/CLI-Reference.md
+@@ -39,9 +39,10 @@ same table from the tool.
+ | flag | default | meaning |
+ |---|---|---|
+ | `--device` | `auto` | `auto` / `cuda` / `cpu` |
+-| `--dtype` | `auto` → bfloat16 | `bfloat16` / `float16` / `float32` |
++| `--dtype` | `auto` → bfloat16 (float16 on pre-Ampere GPUs) | `bfloat16` / `float16` / `float32` |
+ | `--threads` | all cores | limit torch CPU threads (e.g. `4` keeps the machine responsive) |
+ | `--low-mem` | off | halve pair/chunk caps for the metric passes (lower RAM, ~same metrics) |
++| `--profile` | `auto` | hardware profile: `low` = weak-PC defaults, `high` = lift limits (io-cache ram, io-threads 4, calib-bsz 16 on GPU); `auto` = `high` when CUDA present or ≥32 GB RAM + ≥8 cores, else `low`. Explicit `--io-cache`/`--io-threads` win. See [Colab](Colab.md) |
+ 
+ ### Texts & calibration
+ 
+@@ -75,9 +76,9 @@ same table from the tool.
+ 
+ | flag | default | meaning |
+ |---|---|---|
+-| `--io-threads` | `1` | GGUF dequant threads for expert tensors (2-4 on multi-core) |
++| `--io-threads` | auto: `4` on the high profile, else `1` | GGUF dequant threads for expert tensors (2-4 on multi-core) |
+ | `--prefetch` | `1` | background dequant of the next expert block (0 = off, saves ~1 block of RAM) |
+-| `--io-cache` | `disk` | `ram` = keep packed GGUF tensors in RAM (huge win on Colab/Drive/HDD) |
++| `--io-cache` | auto: `ram` when enough free RAM, else `disk` | `ram` = keep packed GGUF tensors in RAM (huge win on Colab/Drive/HDD); auto downgrades to `disk` if the packed file + ~5 GB margin does not fit |
+ | `--full-dequant` | off | build the ~14 GB HF checkpoint (old path; default reads the GGUF directly) |
+ | `--keep-dequant` | off | keep that checkpoint after success (default: deletes itself) |
+ | `--max-shard` | `4GB` | artifact safetensors shard size |
+diff --git a/wiki/Colab.md b/wiki/Colab.md
+new file mode 100644
+index 0000000..92e1174
+--- /dev/null
++++ b/wiki/Colab.md
+@@ -0,0 +1,75 @@
++# Running in Google Colab (and stopping the re-downloads)
++
++Colab resets its disk every session, so without caching you re-download the
++4.4 GB GGUF (and rebuild the calibration pool) on every reconnect. The
++project ships a ready notebook — **`moe_router_colab.ipynb`** (in
++`expert-press-update.zip`) — that wires three cache layers once and then
++never touches the network again.
++
++## One-time setup
++
++1. `Runtime -> Change runtime type -> T4 GPU` (the free tier is enough; the
++   pipeline detects the GPU itself, no code changes needed).
++2. Upload `expert-press-update.zip` to the **root of Google Drive**.
++3. Open the notebook in Colab and run the cells top to bottom.
++
++The notebook is plain Python cells around the usual command —
++`python hf_pipeline.py --gguf ... --rank 32 --device auto`. No adaptation.
++
++## What is cached, where
++
++| thing | size | without caching | with the notebook |
++|---|---|---|---|
++| GGUF source | ~4.4 GB | re-downloaded every session | once into `Drive/moe_router/hf_cache` (`HF_HOME`); then copied Drive -> `/content` per session (~1-2 min) |
++| light catalog (config/tokenizer) | MBs | re-fetched | stays in the same HF cache |
++| calibration pool (stages 3-4) | ~2.3 GB | re-streamed (~tens of min) | synced to `Drive/moe_router/pool_cache`; stages 1-4 are skipped entirely on re-runs |
++| artifact (`field_*_r*`) | ~1.2 GB | **lost** on session reset | synced to `Drive/moe_router/artifacts` |
++| corpus texts | ~6 MB | re-fetched | negligible, local |
++
++The run directory itself (`MOE_OUT_DIR=/content/run`) stays on the **local**
++disk: a Drive FUSE mount turns every small read into a network round-trip
++(see [Memory-and-Speed](Memory-and-Speed.md)). Only finished results are
++synced back.
++
++## The GPU: what turns on automatically
++
++`--device auto` + CUDA present -> the `high` hardware profile (`--profile
++auto`):
++
++- **GPU streaming**: the backbone and every expert block live on cuda:0
++  during their layer's pass (stages 3-4, 7);
++- **dtype fp16 on T4** (sm_75): bf16 has no native T4 support — the profile
++  flips `auto -> float16` and prints it in the `[profile]` line. Ampere+ GPUs
++  keep bf16;
++- **io-cache ram** (if free RAM fits the packed GGUF x2, min 4 GB headroom)
++  and **io-threads 4**;
++- **calib-bsz 16** on GPU — fewer forward calls, fewer block loads in the
++  streaming pass (pairs are position-independent vectors, batch size does
++  not change the pool).
++
++On a weak PC (no CUDA, little RAM) `auto` resolves to `low` — exactly the
++historical conservative behavior. `--profile low` forces it, `--profile
++high` forces the boosts, explicit `--io-cache/--io-threads` always win.
++
++## Typical session (second run onwards)
++
++```
++cell 1: mount Drive, unzip (cached), GPU check
++cell 3: "GGUF готов: ... (4.42 GB)"          <- copied from Drive, no network
++cell 4: "восстанавливаю пул калибровки"      <- stages 1-4 will be skipped
++cell 5: python hf_pipeline.py --gguf ...     <- only fit/save/verify actually run
++cell 6: pool + artifact -> Drive
++```
++
++A new rank (`RANK = 64`) from the same pool skips stages 1-4 as well — only
++the fit re-runs.
++
++## Troubleshooting
++
++- **OOM (12.7 GB RAM)** — pass `--io-cache disk` explicitly; the auto
++  choice downgrades itself when the packed file does not fit, but an
++  explicit flag is a hard guarantee.
++- **`--io-cache ram` warning "is tight"** — you forced it explicitly; the
++  run continues but may hit the commit limit.
++- **Chat with the artifact** — `!python hf_chat.py --model {ART} --device auto`.
++- The per-page CLI details live in [CLI-Reference](CLI-Reference.md).
+diff --git a/wiki/Home.md b/wiki/Home.md
+index 37c74f9..cac58fe 100644
+--- a/wiki/Home.md
++++ b/wiki/Home.md
+@@ -19,6 +19,7 @@ smaller than the source Q4 GGUF (4.4 GB).
+ | [Field-Engine](Field-Engine.md) | the method: formula, what is stored, why the router seed works, accounting |
+ | [Pipeline-and-Stages](Pipeline-and-Stages.md) | the 9-stage auto pipeline, **stage toggles** (`--stages` / `--skip`), caches |
+ | [Memory-and-Speed](Memory-and-Speed.md) | streaming, `--io-cache ram`, threads/prefetch/workers, disk layout |
++| [Colab](Colab.md) | the ready notebook: GPU runtime, Drive caching that kills re-downloads, hardware profiles |
+ | [Quality-and-Calibration](Quality-and-Calibration.md) | the KL protocol, style-drift findings, temperature calibration, min-p, refine |
+ | [Router-Diagnostics](Router-Diagnostics.md) | `router_audit.py` (3 phases), `router_ft.py` gate calibration, `field_dims.py` |
+ | [Research-History](Research-History.md) | the experiment ladder that led to the field, **with all charts** |
+diff --git a/wiki/Memory-and-Speed.md b/wiki/Memory-and-Speed.md
+index 7789d51..ea046db 100644
+--- a/wiki/Memory-and-Speed.md
++++ b/wiki/Memory-and-Speed.md
+@@ -18,12 +18,31 @@ Knobs:
+ 
+ - `--prefetch 0` — disable the background reader (saves ~1 block of RAM);
+ - `--io-threads 2..4` — parallel dequant threads for the expert tensors
+-  (faster block loads on multi-core CPUs);
++  (faster block loads on multi-core CPUs; default: auto, 4 on the high
++  profile);
+ - `--io-cache ram` — copy the packed GGUF tensors into RAM on first touch
+   (~= packed file size). Every later pass (pool collection, refits, artifact
+   write) then reads **nothing from disk** — the big win on Colab/Drive or an
+   HDD. A process-wide cache shared by all passes; correctness is covered by
+-  `test_io_cache.py` / `test_io_cache_stream.py`.
++  `test_io_cache.py` / `test_io_cache_stream.py`. Default: auto — `ram` when
++  enough free RAM, else `disk` (see profiles below).
++
++## Hardware profiles (`--profile auto|low|high`)
++
++The historical defaults are tuned for an 8 GB weak PC. On a stronger box
++they leave speed on the table, so the pipeline resolves a profile at
++startup (printed in the `hardware:` line):
++
++- `low` — the weak-PC defaults, unchanged (io-cache disk, 1 io thread);
++- `high` — CUDA present, or >= 32 GB RAM + >= 8 cores: `io-cache ram`,
++  `io-threads 4`, `calib-bsz 16` on GPU, and **fp16 on pre-Ampere GPUs**
++  (a T4 has no native bf16 — emulated and slow; `auto` dtype flips to
++  `float16` there);
++- `auto` (default) — `high` when the machine qualifies, else `low`.
++
++The GPU is used by the whole streaming path: backbone and expert blocks sit
++on cuda:0 during their layer's pass. Explicit `--io-cache / --io-threads`
++flags always beat the profile boosts; `--low-mem` caps still apply on top.
+ 
+ ## Disk layout (OLMoE Q4_K_M)
+ 
+@@ -76,4 +95,6 @@ comfortable end-to-end.
+ 
+ The HF cache is redirected **into the project** (`hf_env.py`, imported
+ first everywhere), so nothing lands on the system drive — relevant for
+-Colab and shared machines. See `hf_cache/` in the project root.
++Colab and shared machines. See `hf_cache/` in the project root. On Colab,
++`HF_HOME` exported to a Drive folder keeps every download across sessions —
++see [Colab](Colab.md).
+-- 
+2.47.3
+
+
+From 6c4235c5e80adf03d1e36ec37ac5fdd72647528e Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Tue, 1 Sep 2026 20:14:20 +0000
+Subject: [PATCH 5/7] Fit guard: best-state tracking + divergence bailout
+
+fit_field_module now snapshots the field params (cpu) whenever the EMA
+of the minibatch mse improves meaningfully. A late blow-up (a degenerate
+batch can spike Adam: a real run died with mse 0.23 -> 0.10 by step 500,
+then 33.9 at step 599, tripping the old final-vs-first FIT GUARD) now
+bails out early, restores the best snapshot and re-evaluates it honestly;
+a slow end-of-fit drift (>2% above the best EMA) restores the snapshot
+too. The guard judges the restored weights, so it still catches fits
+that never learn (zero U,V,C signature) but can no longer kill a fit
+that was actually learning - and the exploded weights are never shipped.
+---
+ hf_field_transform.py | 89 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 85 insertions(+), 4 deletions(-)
+
+diff --git a/hf_field_transform.py b/hf_field_transform.py
+index 8e987ac..3a15b3e 100644
+--- a/hf_field_transform.py
++++ b/hf_field_transform.py
+@@ -310,6 +310,16 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
+     warmup of ~steps/4) and stop after 2 consecutive checkpoints with <0.5%
+     relative improvement (saves steps on plateauing blocks).
+ 
++    Best-state tracking (divergence insurance): whenever the EMA of the
++    per-step minibatch mse improves meaningfully, the parameters are
++    snapshotted (cpu copy). If the fit blows up late (a degenerate batch can
++    spike Adam: a real run died with mse 0.23 -> 0.10 by step 500, then 33.9
++    at step 599, which tripped the old final-vs-first guard), the loop bails
++    out early and the best snapshot is restored; a slow end-of-fit drift
++    (>2% above the best EMA) restores it too. The returned mse and the FIT
++    GUARD therefore always judge the weights that will actually be shipped,
++    not a possibly exploded last step.
++
+     method: "adam" | "adamw" | "adam-cosine" | "rmsprop"
+       adam        - plain Adam, constant lr (classic baseline)
+       adamw       - AdamW with a small weight decay (less drift in U,V)
+@@ -363,10 +373,25 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
+             tgt = Y.float() - (mod.act_fn(sg) * su) @ mod.sh_dn.t()
+         else:
+             tgt = Y.float()
++
++    # best-state machinery (see the docstring: divergence insurance)
++    def _snapshot():
++        return [t.detach().to("cpu", copy=True) for t in p]
++
++    def _restore():
++        with torch.no_grad():
++            for t, snap in zip(p, best_state):
++                t.copy_(snap.to(t.device))
++
+     last = first = None
+     ckpt_ema = None
+     stall = 0
+     warm = min(150, max(10, steps // 4)) if early_stop else steps
++    ema = None                              # EMA of the minibatch mse
++    best_score = None                       # ema at the last snapshot
++    best_state = None                       # field params at that point (cpu)
++    last_snap = 0
++    restored = False
+     for s in range(steps):
+         if gen is not None:
+             ix = torch.randint(0, n_tok, (min(bs, n_tok),), generator=gen)
+@@ -398,12 +423,32 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
+             first = last
+         if s % log_every == 0 or s == steps - 1:
+             print(f"    {log_prefix} step {s}: mse {last:.5f}", flush=True)
++        if not math.isfinite(last):
++            print(f"    {log_prefix} non-finite loss at step {s} - best "
++                  f"state restored, stopping this block early", flush=True)
++            if best_state is not None:
++                _restore()
++                restored = True
++            break
++        ema = last if ema is None else 0.9 * ema + 0.1 * last
++        if best_state is None:
++            best_score, best_state, last_snap = ema, _snapshot(), s
++        elif ema < best_score * 0.998 and s - last_snap >= 20:
++            best_score, best_state, last_snap = ema, _snapshot(), s
++        elif best_score > 0 and ema > 2.0 * best_score:
++            print(f"    {log_prefix} loss diverged at step {s} (mse "
++                  f"{last:.5f}, ema {ema:.5f} vs best {best_score:.5f}) - "
++                  f"best state restored, stopping this block early",
++                  flush=True)
++            _restore()
++            restored = True
++            break
+         if early_stop and s >= warm and (s % early_stop == 0 or s == steps - 1):
+             # 2 consecutive flat checkpoints (<0.5% relative) -> stop early;
+             # the checkpoint is an EMA of the minibatch mse (a raw single-batch
+             # value is noisy: one lucky/unlucky batch can hide or fake a plateau)
+-            ema = last if ckpt_ema is None else 0.5 * ckpt_ema + 0.5 * last
+-            if ckpt_ema is not None and ema > ckpt_ema * (1.0 - 0.005):
++            cema = last if ckpt_ema is None else 0.5 * ckpt_ema + 0.5 * last
++            if ckpt_ema is not None and cema > ckpt_ema * (1.0 - 0.005):
+                 stall += 1
+                 if stall >= 2:
+                     print(f"    {log_prefix} early stop at step {s} "
+@@ -411,10 +456,46 @@ def fit_field_module(mod, X, Y, steps, bs, lr, device, log_prefix="",
+                     break
+             else:
+                 stall = 0
+-            ckpt_ema = ema
++            ckpt_ema = cema
+     for t in p:
+         t.requires_grad_(False)
+-    if guard and first is not None and last > 0.98 * first:
++    if best_state is not None and not restored and math.isfinite(ema) \
++            and ema > best_score * 1.02:
++        # a slow late drift the 2x bailout never caught - still ship the
++        # best point, not the final one
++        print(f"    {log_prefix} mse drifted up by the end (ema {ema:.5f} "
++              f"vs best {best_score:.5f}) - best state restored", flush=True)
++        _restore()
++        restored = True
++    if restored:
++        # the shipped weights are the restored best ones: re-measure the loss
++        # on a few fresh batches (same jitter convention as the fit) so the
++        # guard and the report describe what is actually being shipped
++        tot, n_ev = 0.0, 8
++        with torch.no_grad():
++            for _ in range(n_ev):
++                ix = (torch.randint(0, n_tok, (min(bs, n_tok),), generator=gen)
++                      if gen is not None
++                      else torch.randint(0, n_tok, (min(bs, n_tok),)))
++                xb = Xf[ix].to(device, non_blocking=True)
++                yb = tgt[ix].to(device, non_blocking=True)
++                if x_std is not None:
++                    jx = (torch.randint(0, n_tok, (min(bs, n_tok),),
++                                        generator=gen)
++                          if gen is not None
++                          else torch.randint(0, n_tok, (min(bs, n_tok),)))
++                    xb = xb + noise_pool[jx].to(device)
++                    zb = mod._z(xb).detach()
++                else:
++                    zb = z_all[ix].to(device, non_blocking=True)
++                tot += float(F.mse_loss(mod.forward_from_z(xb, zb),
++                                        yb).item())
++        last = tot / n_ev
++        print(f"    {log_prefix} best-state re-eval: mse {last:.5f}",
++              flush=True)
++        best_state = None
++    if guard and first is not None and (not math.isfinite(last)
++                                        or last > 0.98 * first):
+         raise RuntimeError(
+             f"FIT GUARD: mse did not drop ({first:.5f} -> {last:.5f}) - the "
+             f"field is not learning (a typical cause is a degenerate gradient). "
+-- 
+2.47.3
+
+
+From a01cdae394cd2b3f6e9c699a77a1a2a6ce6d141f Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Tue, 1 Sep 2026 20:17:23 +0000
+Subject: [PATCH 6/7] Resume check: a 0-byte fit_blkN.pt counts as missing
+
+A fit file that exists but is empty is a leftover of an interrupted
+write (hit in the wild: a stale 0-byte fit_blk0.pt made the fit stage
+skip and the save stage die with EOFError in torch.load). fit_blocks_ok()
+now requires a non-zero size in both the ensure_prereqs check and the
+fit-stage resume check.
+---
+ hf_pipeline.py | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/hf_pipeline.py b/hf_pipeline.py
+index 3ad4c10..d26e430 100644
+--- a/hf_pipeline.py
++++ b/hf_pipeline.py
+@@ -368,6 +368,15 @@ def resolve_plan(args):
+     return [s for s in STAGE_ORDER if s in wanted]
+ 
+ 
++def fit_blocks_ok(fit_dir, n):
++    """True when every fit_blkN.pt exists and is non-empty. A 0-byte file is
++    a leftover of an interrupted write (seen in the wild): treat it as
++    missing so the fit re-runs instead of dying later in torch.load."""
++    return all(os.path.isfile(os.path.join(fit_dir, f"fit_blk{i}.pt"))
++               and os.path.getsize(os.path.join(fit_dir, f"fit_blk{i}.pt")) > 0
++               for i in range(n))
++
++
+ def ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, min_pairs):
+     """Auto-add cheap missing stages with a notice; hard-fail with a hint when
+     an expensive prerequisite is absent from disk AND from the plan. Returns
+@@ -403,8 +412,7 @@ def ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, min_pairs):
+                  f"plan), or drop 'fit' from --stages{hint}")
+     if ("save" in plan or "refine" in plan) and "fit" not in plan:
+         n = pairs or 0
+-        if not n or not all(os.path.isfile(os.path.join(fit_dir, f"fit_blk{i}.pt"))
+-                            for i in range(n)):
++        if not n or not fit_blocks_ok(fit_dir, n):
+             what = "stage 'refine': the fits" if "refine" in plan else \
+                    "stage 'save': the fits"
+             sys.exit(f"{what} are missing in {fit_dir}\n"
+@@ -1062,8 +1070,7 @@ def main():
+                        fit_early_stop=args.fit_early_stop,
+                        preset=fit_preset or "none")
+         fit_meta_p = os.path.join(fit_dir, "fit_meta.json")
+-        fit_done = all(os.path.isfile(os.path.join(fit_dir, f"fit_blk{i}.pt"))
+-                       for i in range(n_blocks)) and os.path.isfile(fit_meta_p)
++        fit_done = fit_blocks_ok(fit_dir, n_blocks) and os.path.isfile(fit_meta_p)
+         if fit_done:
+             with open(fit_meta_p, encoding="utf-8") as f:
+                 fit_done = json.load(f) == fit_sig
+-- 
+2.47.3
+
+
+From 8865eae90b0a30e161c47a9da883de889183c82d Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Tue, 1 Sep 2026 20:40:19 +0000
+Subject: [PATCH 7/7] Startup compat check: detect a partially updated folder
+
+Hit in the wild: the new hf_pipeline.py next to an old hf_stream.py
+(no BlockStreamRunner) crashed with a bare ImportError deep in main().
+_compat_check() now runs first and verifies one signature symbol per
+sibling module (hf_env.CACHE, hf_stream.BlockStreamRunner,
+hf_field_transform._mdev/block_router_bias/block_shared_weights,
+hf_gguf_to_hf.resolve_gguf), telling the user exactly which file is
+outdated and to re-copy the whole package.
+---
+ hf_pipeline.py | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/hf_pipeline.py b/hf_pipeline.py
+index d26e430..e9e2a37 100644
+--- a/hf_pipeline.py
++++ b/hf_pipeline.py
+@@ -558,7 +558,36 @@ def print_profile(args, fit, preset):
+     print("profile: " + " | ".join(f"{k}={v}" for k, v in rows), flush=True)
+ 
+ 
++def _compat_check():
++    """Fail fast with one clear message when the sibling .py files are older
++    than this hf_pipeline.py (a partial update - hit in the wild: a folder
++    with the new hf_pipeline.py but an old hf_stream.py without
++    BlockStreamRunner). Every symbol below was added by a specific update
++    commit, so a missing one dates the stale file precisely."""
++    need = {
++        "hf_env": ("CACHE",),
++        "hf_stream": ("BlockStreamRunner",),
++        "hf_field_transform": ("_mdev", "fit_field_module",
++                               "block_router_bias", "block_shared_weights"),
++        "hf_gguf_to_hf": ("resolve_gguf",),
++    }
++    for mod, names in need.items():
++        try:
++            m = importlib.import_module(mod)
++        except Exception as e:  # noqa: BLE001
++            sys.exit(f"[update] cannot import {mod}.py: {e}\n"
++                     "[update] the folder has a broken/mixed file set - "
++                     "re-copy ALL .py files from the update package")
++        missing = [n for n in names if not hasattr(m, n)]
++        if missing:
++            sys.exit(f"[update] {mod}.py is OUTDATED "
++                     f"(missing: {', '.join(missing)})\n"
++                     "[update] this hf_pipeline.py is from the full update "
++                     "package - re-copy ALL .py files from it, not just some")
++
++
+ def main():
++    _compat_check()
+     ap = argparse.ArgumentParser(description=__doc__,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+     ap.add_argument("--model",
 -- 
 2.47.3
 

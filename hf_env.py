@@ -14,7 +14,9 @@ If HF_HOME/HF_HUB_CACHE are set manually BEFORE the run, they are kept
 import os
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-CACHE = os.path.join(ROOT, "hf_cache")
+# MOE_HF_CACHE - explicit project override; an already-set HF_HOME still wins
+# (e.g. a Drive path exported by the Colab notebook before the import)
+CACHE = os.environ.get("MOE_HF_CACHE") or os.path.join(ROOT, "hf_cache")
 
 
 def apply() -> str:

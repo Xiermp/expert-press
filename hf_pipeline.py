@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+# version: 2026-09-02.4 - fix "8.2 got SLOWER than 8.1": the auto decision
+#   now times ~8 REAL fit steps (fp32 vs bf16) instead of one big matmul,
+#   and keeps bf16 only if the full step is >=1.2x faster; the fit cache
+#   signature is UNCHANGED (the --fit-autocast string), so 8.2 fit
+#   artifacts stay valid. Also fixes the 8.2 UnboundLocalError that made
+#   any adam-family fit crash (ac was muon-branch-only). 2026-09-02.3:
+#   fit STEP SPEED: the fit forward runs under bf16
+#   autocast where the machine actually benefits (--fit-autocast
+#   auto|bf16|fp32; params/optimizer
+#   stay fp32, quality measured identical) + --muon-ns-steps (default 5).
+#   The step log now also prints the torch thread count at the STAGE 5
+#   banner (a 1-thread torch on a many-core box is the classic "6.86 s/step"
+#   culprit). 2026-09-02.2: fit resilience (lr/2 retry, biggest-moves
+#   diagnostics, --fit-log-every). 2026-09-02.1: Muon is the MANDATORY
+#   default fit optimizer (--fit-method muon; adam family kept for A/B
+#   rollbacks; big params fall back to Adam on CPU via --muon-max-dim) +
+#   --replace-router (FieldNoRouter: smooth coordinate map g(x) instead of
+#   the discrete router; opt-in, EXPERIMENTAL) + --norouter-hidden.
+#   Base: expert-press-update (7).zip (sha256 8a471b7d...).
 """Pipeline for a REAL MoE model from HuggingFace -> "field engine".
 
 The model is downloaded ALREADY QUANTIZED - by default the ready Q4_K_M GGUF
@@ -49,7 +68,13 @@ Local run:
 
 Fit tuning:
   --fit-preset fast|balanced|quality           # steps/batch/lr/method bundles
-  --fit-method adam|adamw|adam-cosine|rmsprop  # optimizer type
+  --fit-method muon|muon-cosine|adam|adamw|adam-cosine|rmsprop
+                                               # Muon is the MANDATORY default;
+                                               # adam family = A/B rollbacks
+  --muon-max-dim 512                           # min(shape) cap for Newton-Schulz
+                                               # (bigger params -> paired Adam;
+                                               # raise on GPU to cover all)
+  --replace-router                             # EXPERIMENTAL FieldNoRouter mode
   --fit-workers 2                              # parallel fit of independent blocks
   --prefetch 0                                 # disable background block prefetch
                                                # (saves ~1 block of RAM)
@@ -98,13 +123,48 @@ CORPUS_URLS = (
 REQUIRED = [("transformers", "transformers>=5"), ("huggingface_hub", "huggingface_hub"),
             ("safetensors", "safetensors"), ("accelerate", "accelerate")]
 # fit presets: bundles of steps/batch/lr/method (explicit flags always win)
+# Muon is the MANDATORY default since 2026-09-02.1 (user measurements: same
+# quality in ~half the Adam steps on the matrix field params; lr peak
+# ~0.003-0.005). Rollback for A/B: --fit-method adam-cosine (the old default).
 FIT_PRESETS = {
-    "fast":     dict(fit_steps=120, fit_bs=4096, fit_lr=3e-3, fit_method="adam-cosine"),
-    "balanced": dict(fit_steps=300, fit_bs=4096, fit_lr=2e-3, fit_method="adam-cosine"),
-    "quality":  dict(fit_steps=600, fit_bs=8192, fit_lr=2e-3, fit_method="adam-cosine"),
+    "fast":     dict(fit_steps=120, fit_bs=4096, fit_lr=4e-3, fit_method="muon"),
+    "balanced": dict(fit_steps=300, fit_bs=4096, fit_lr=4e-3, fit_method="muon"),
+    "quality":  dict(fit_steps=600, fit_bs=8192, fit_lr=3e-3, fit_method="muon"),
 }
-FIT_LEGACY = dict(fit_steps=300, fit_bs=4096, fit_lr=2e-3, fit_method="adam")
+FIT_LEGACY = dict(fit_steps=300, fit_bs=4096, fit_lr=4e-3, fit_method="muon")
 T = {}
+
+
+def fit_block_with_retry(fft, make_mod, X, Y, lr, steps, bs, device,
+                         log_prefix, guard, method, seed, jitter, early_stop,
+                         muon_max_dim, log_every, autocast="auto",
+                         muon_ns_steps=5):
+    """Fit one block; on a FIT GUARD trip ("mse did not drop" - the classic
+    signature of a diverged / random-walking fit) retry ONCE at lr/2 with a
+    fresh module. A diverged block ships at ~baseline and would otherwise
+    kill the whole run at the guard; halving the lr tames the walk, while
+    healthy blocks are untouched (the retry only fires on a guard failure).
+    fft: fit_field_module (passed in - it is imported inside main()).
+    make_mod: () -> a freshly built fit module (the first attempt leaves the
+    module state dirty, the retry must start from the pristine init)."""
+    try:
+        mod = make_mod()
+        return mod, fft(mod, X, Y, steps, bs, lr, device,
+                        log_prefix=log_prefix, guard=guard, method=method,
+                        seed=seed, jitter=jitter, early_stop=early_stop,
+                        muon_max_dim=muon_max_dim, log_every=log_every,
+                        autocast=autocast, muon_ns_steps=muon_ns_steps)
+    except RuntimeError as e:
+        if "FIT GUARD: mse did not drop" not in str(e):
+            raise
+    print(f"    {log_prefix} FIT GUARD tripped - retrying once at lr/2 "
+          f"({lr:.2e} -> {lr / 2:.2e})", flush=True)
+    mod = make_mod()
+    return mod, fft(mod, X, Y, steps, bs, lr / 2, device,
+                    log_prefix=log_prefix, guard=guard, method=method,
+                    seed=seed, jitter=jitter, early_stop=early_stop,
+                    muon_max_dim=muon_max_dim, log_every=log_every,
+                    autocast=autocast, muon_ns_steps=muon_ns_steps)
 
 # Pipeline stages: togglable via --stages / --skip (names in run order).
 STAGE_ORDER = ["download", "texts", "base", "calibrate", "fit", "refine",
@@ -368,6 +428,15 @@ def resolve_plan(args):
     return [s for s in STAGE_ORDER if s in wanted]
 
 
+def fit_blocks_ok(fit_dir, n):
+    """True when every fit_blkN.pt exists and is non-empty. A 0-byte file is
+    a leftover of an interrupted write (seen in the wild): treat it as
+    missing so the fit re-runs instead of dying later in torch.load."""
+    return all(os.path.isfile(os.path.join(fit_dir, f"fit_blk{i}.pt"))
+               and os.path.getsize(os.path.join(fit_dir, f"fit_blk{i}.pt")) > 0
+               for i in range(n))
+
+
 def ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, min_pairs):
     """Auto-add cheap missing stages with a notice; hard-fail with a hint when
     an expensive prerequisite is absent from disk AND from the plan. Returns
@@ -403,8 +472,7 @@ def ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, min_pairs):
                  f"plan), or drop 'fit' from --stages{hint}")
     if ("save" in plan or "refine" in plan) and "fit" not in plan:
         n = pairs or 0
-        if not n or not all(os.path.isfile(os.path.join(fit_dir, f"fit_blk{i}.pt"))
-                            for i in range(n)):
+        if not n or not fit_blocks_ok(fit_dir, n):
             what = "stage 'refine': the fits" if "refine" in plan else \
                    "stage 'save': the fits"
             sys.exit(f"{what} are missing in {fit_dir}\n"
@@ -432,9 +500,105 @@ def ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, min_pairs):
     return plan
 
 
+def ram_gb(available=False):
+    """GB of RAM (available/total); best effort - never raises."""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        return (vm.available if available else vm.total) / 1e9
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            info = {}
+            for line in f:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    info[k] = int(v.strip().split()[0]) * 1024
+        total = info.get("MemTotal", 0)
+        avail = info.get("MemAvailable", total)
+        return (avail if available else total) / 1e9
+    except Exception:
+        return 8.0
+
+
+def _cuda_ok():
+    """Cheap CUDA probe that works before the bootstrap stage."""
+    if os.environ.get("CUDA_VISIBLE_DEVICES") == "":
+        return False
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def apply_hardware_profile(args, device):
+    """--profile auto|low|high: lift the conservative defaults on strong
+    hardware, keep them 1:1 on a weak box. Explicit flags always win: only
+    values still at their None placeholder are auto-filled."""
+    cuda = (device == "cuda")
+    total_gb, cores = ram_gb(), (os.cpu_count() or 1)
+    if getattr(args, "profile", "auto") == "auto":
+        args.profile = "high" if (cuda or (total_gb >= 32 and cores >= 8)) else "low"
+    high = (args.profile == "high")
+    low_mem = getattr(args, "low_mem", False)
+    if getattr(args, "io_cache", None) is None:
+        args.io_cache = "ram" if (high and not low_mem) else "disk"
+        args._io_cache_auto = True
+    if getattr(args, "io_threads", None) is None:
+        args.io_threads = 4 if high else 1
+    bsz16 = (high and cuda and not low_mem)
+    if getattr(args, "calib_bsz", None) is None:
+        args.calib_bsz = 16 if bsz16 else 8
+    elif bsz16 and args.calib_bsz == 8:
+        args.calib_bsz = 16
+    if high and cuda and not low_mem:
+        if getattr(args, "dtype", "auto") == "auto":
+            try:
+                import torch
+                if tuple(torch.cuda.get_device_capability()) < (8, 0):
+                    args.dtype = "float16"   # bf16 needs sm_80+ (T4 = sm_75)
+                    print("[profile] pre-Ampere GPU: dtype auto -> float16 "
+                          "(no native bfloat16)", flush=True)
+            except Exception:
+                pass
+    print(f"[profile] {args.profile} (device={device}, ram={total_gb:.0f} GB, "
+          f"cores={cores}) -> io-cache={args.io_cache}, "
+          f"io-threads={args.io_threads}, calib-bsz={args.calib_bsz}"
+          + (f", dtype={args.dtype}" if getattr(args, "dtype", "auto") != "auto"
+             else ""), flush=True)
+
+
+def check_io_cache_fit(args, gguf_path):
+    """io-cache ram needs the GGUF (+ dequant headroom) in free RAM; an
+    auto-selected ram cache downgrades to disk when it does not fit, an
+    explicit one only warns."""
+    if getattr(args, "io_cache", None) != "ram" or not gguf_path:
+        return
+    try:
+        size_gb = os.path.getsize(gguf_path) / 1e9
+    except OSError:
+        return
+    avail = ram_gb(available=True)
+    if avail >= max(size_gb * 2.0, 4.0):
+        return
+    if getattr(args, "_io_cache_auto", False):
+        print(f"[profile] io-cache ram: {avail:.1f} GB free is too tight for a "
+              f"{size_gb:.1f} GB GGUF (+headroom) -> falling back to disk",
+              flush=True)
+        args.io_cache = "disk"
+    else:
+        print(f"[profile] WARNING: io-cache ram may not fit ({size_gb:.1f} GB "
+              f"GGUF, {avail:.1f} GB free) - kept as explicitly requested",
+              flush=True)
+
+
 def print_profile(args, fit, preset):
     """One place to see everything the run will actually use."""
     rows = [
+        ("profile", args.profile),
+        ("io_cache", args.io_cache),
         ("model", args.model),
         ("quant", "auto" if str(args.gguf_quant).lower() == "auto" else args.gguf_quant),
         ("rank", args.rank),
@@ -454,7 +618,37 @@ def print_profile(args, fit, preset):
     print("profile: " + " | ".join(f"{k}={v}" for k, v in rows), flush=True)
 
 
+def _compat_check():
+    """Fail fast with one clear message when the sibling .py files are older
+    than this hf_pipeline.py (a partial update - hit in the wild: a folder
+    with the new hf_pipeline.py but an old hf_stream.py without
+    BlockStreamRunner). Every symbol below was added by a specific update
+    commit, so a missing one dates the stale file precisely."""
+    need = {
+        "hf_env": ("CACHE",),
+        "hf_stream": ("BlockStreamRunner",),
+        "hf_field_transform": ("_mdev", "fit_field_module",
+                               "block_router_bias", "block_shared_weights",
+                               "Muon", "MUON_NS_MAX_DIM"),
+        "hf_gguf_to_hf": ("resolve_gguf",),
+    }
+    for mod, names in need.items():
+        try:
+            m = importlib.import_module(mod)
+        except Exception as e:  # noqa: BLE001
+            sys.exit(f"[update] cannot import {mod}.py: {e}\n"
+                     "[update] the folder has a broken/mixed file set - "
+                     "re-copy ALL .py files from the update package")
+        missing = [n for n in names if not hasattr(m, n)]
+        if missing:
+            sys.exit(f"[update] {mod}.py is OUTDATED "
+                     f"(missing: {', '.join(missing)})\n"
+                     "[update] this hf_pipeline.py is from the full update "
+                     "package - re-copy ALL .py files from it, not just some")
+
+
 def main():
+    _compat_check()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model",
@@ -482,13 +676,22 @@ def main():
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--dtype", default="auto",
                     choices=["auto", "bfloat16", "float16", "float32"])
+    ap.add_argument("--profile", default="auto", choices=["auto", "low", "high"],
+                    help="hardware profile: auto detects it (CUDA, or 32 GB+ RAM "
+                         "and 8+ cores -> high, else low); high lifts the "
+                         "conservative defaults on a strong box (io-cache ram, "
+                         "io-threads 4, calib-bsz 16 on GPU, fp16 on pre-Ampere "
+                         "GPUs); low = the classic cautious defaults. Explicit "
+                         "--io-cache/--io-threads/--calib-bsz/--dtype always win")
     ap.add_argument("--calib-file", default=None)
     ap.add_argument("--eval-file", default=None)
     ap.add_argument("--calib-dataset", default=None,
                     help="e.g. wikitext-2-raw-v1 (requires datasets)")
     ap.add_argument("--text-cap", type=int, default=3_000_000, help="text characters")
     ap.add_argument("--calib-windows", type=int, default=3)
-    ap.add_argument("--calib-bsz", type=int, default=8)
+    ap.add_argument("--calib-bsz", type=int, default=None,
+                    help="calibration batch size (default: 8, or 16 on a GPU "
+                         "under the high profile)")
     ap.add_argument("--calib-ctx", type=int, default=512)
     ap.add_argument("--per-layer-cap", type=int, default=8192)
     ap.add_argument("--fit-steps", type=int, default=None,
@@ -496,10 +699,13 @@ def main():
     ap.add_argument("--fit-bs", type=int, default=None,
                     help="fit batch size (default: 4096, or the preset value)")
     ap.add_argument("--fit-lr", type=float, default=None,
-                    help="fit learning rate (default: 2e-3, or the preset value)")
+                    help="fit learning rate (default: 4e-3 for muon, or the "
+                         "preset value)")
     ap.add_argument("--fit-method", default=None,
-                    help="optimizer: adam | adamw | adam-cosine | rmsprop "
-                         "(default: adam, or the preset value)")
+                    help="optimizer: muon (MANDATORY default) | muon-cosine | "
+                         "adam | adamw | adam-cosine | rmsprop "
+                         "(default: the preset value; adam-cosine = the old "
+                         "behavior, for A/B rollbacks)")
     ap.add_argument("--fit-jitter", type=float, default=0.0,
                     help="Gaussian noise on fit inputs, per-dim std units "
                          "(variance reduction for a SMALL calibration pool: "
@@ -512,10 +718,45 @@ def main():
     ap.add_argument("--fit-workers", type=int, default=1,
                     help="parallel fit workers for independent blocks (2-4 on a "
                          "multi-core CPU; 1 = sequential)")
+    ap.add_argument("--fit-log-every", type=int, default=100,
+                    help="log the fit mse every N steps (default 100; set "
+                         "e.g. 25 to actually see movement on slow blocks)")
+    ap.add_argument("--fit-autocast", default="auto",
+                    choices=["auto", "bf16", "fp32"],
+                    help="run the fit forward under bf16 autocast (params and "
+                         "optimizer state stay fp32): 1.8-2.8x faster steps on "
+                         "AMX/AVX512-BF16 CPUs and on GPUs, quality measured "
+                         "identical; auto (default) times REAL fit steps in "
+                         "both dtypes once per geometry and keeps bf16 only "
+                         "where the full step is >=1.2x faster (a big-matmul "
+                         "probe alone can lie on CPUs without fast bf16); "
+                         "fp32 = the old behavior")
+    ap.add_argument("--muon-ns-steps", type=int, default=5,
+                    help="Newton-Schulz iterations per Muon step (default 5; "
+                         "3 saves ~40%% of the NS time at <=0.5%% quality cost "
+                         "- for slow CPUs where NS is a visible share)")
     ap.add_argument("--fit-early-stop", type=int, default=0,
                     help="stop each block's fit after 2 consecutive flat mse "
                          "checkpoints (every N steps, e.g. 50; 0 = off). Saves "
                          "time on plateauing blocks")
+    ap.add_argument("--muon-max-dim", type=int, default=None,
+                    help="min(shape) cap for Muon's Newton-Schulz update; "
+                         "bigger params (full-size centroids) fall back to a "
+                         "paired Adam (default 512 - CPU-friendly; raise on "
+                         "GPU, e.g. 4096, to cover everything)")
+    ap.add_argument("--replace-router", action="store_true",
+                    help="EXPERIMENTAL FieldNoRouter mode (opt-in): fit and "
+                         "deploy the field WITHOUT the discrete router - the "
+                         "coordinates come from a smooth direct map g(x) "
+                         "(removes the top-k boundary discontinuity; the toy "
+                         "verdict of 2026-09-02). The artifact's "
+                         "modeling_field.py gets a self-contained no-router "
+                         "runtime appended; base artifacts are unaffected")
+    ap.add_argument("--norouter-hidden", type=int, default=0,
+                    help="hidden width of the smooth coordinate map g(x) in "
+                         "--replace-router mode (0 = linear map, the toy-"
+                         "proven config; e.g. 256 = one-GELU MLP - slightly "
+                         "better in the 2026-09-02 toy R2, slower to fit)")
     ap.add_argument("--refine-rounds", type=int, default=0,
                     help="self-distillation rounds after the first fit (try 1-2): "
                          "a streaming pass where the FIELD model feeds its own "
@@ -523,19 +764,21 @@ def main():
                          "targets, then a warm-started refit. Fixes the compounding "
                          "error the first fit cannot see (it is calibrated on the "
                          "BASE model's activations)")
-    ap.add_argument("--io-threads", type=int, default=1,
+    ap.add_argument("--io-threads", type=int, default=None,
                     help="threads for GGUF dequant of expert tensors (2-4 speeds "
                          "up stage 3-4/6 block reads on a multi-core CPU; "
-                         "1 = single-threaded)")
+                         "default: 1, or 4 under the high profile)")
     ap.add_argument("--prefetch", type=int, default=1,
                     help="background prefetch of the next expert block while the "
                          "current layer computes (default 1; 0 = off, saves ~1 "
                          "block of RAM)")
-    ap.add_argument("--io-cache", choices=["disk", "ram"], default="disk",
+    ap.add_argument("--io-cache", choices=["disk", "ram"], default=None,
                     help="ram: copy the packed GGUF tensors into RAM on first "
                          "touch (~= packed file size); later passes (pool "
                          "collection, refit, artifact write) read nothing from "
-                         "disk - big win on Colab/Drive or HDD")
+                         "disk - big win on Colab/Drive or HDD (default: auto - "
+                         "disk, or ram under the high profile when the GGUF "
+                         "fits in free RAM)")
     ap.add_argument("--eval-chunks", type=int, default=50)
     ap.add_argument("--kl-chunks", type=int, default=16)
     ap.add_argument("--eval-ctx", type=int, default=512)
@@ -585,6 +828,9 @@ def main():
                     help="mini wiring run: short fit/eval")
     args = ap.parse_args()
     plan = resolve_plan(args)          # may exit (--list-stages / bad names)
+    device_hint = "cuda" if (args.device == "cuda"
+                             or (args.device == "auto" and _cuda_ok())) else "cpu"
+    apply_hardware_profile(args, device_hint)
     if args.smoke:
         args.calib_windows, args.calib_bsz, args.calib_ctx = 2, 2, 128
         args.per_layer_cap, args.fit_steps, args.fit_bs = 2048, 60, 2048
@@ -620,7 +866,7 @@ def main():
                                     fit_field_module, generate_text,
                                     load_pairs_block, make_batches,
                                     router_weight, save_pairs_block,
-                                    write_field_artifact,
+                                    write_field_artifact, MUON_NS_MAX_DIM,
                                     FieldSparseMoe)
     from hf_stream import BlockStreamRunner
     if args.threads:
@@ -637,6 +883,7 @@ def main():
     else:
         dtype = getattr(torch, args.dtype)
     T["device"], T["dtype"] = str(device), str(dtype)
+    T["profile"], T["io_cache"] = args.profile, args.io_cache
 
     def base_label():
         sq = str(T.get("source_quant", "none"))
@@ -679,6 +926,7 @@ def main():
         T["source_quant"] = f"gguf:{args.gguf_quant}"
         print(f"source: {src_name} "
               f"({os.path.getsize(gguf_path) / 1e9:.2f} GB)", flush=True)
+        check_io_cache_fit(args, gguf_path)
         conv_dir = args.gguf_out or os.path.join(
             DL, "gguf_hf", os.path.basename(gguf_path).removesuffix(".gguf") + "-hf")
         if args.full_dequant:
@@ -944,14 +1192,21 @@ def main():
     else:
         banner(f"STAGE 5 - field fit r={args.rank} on pairs from disk "
                f"({args.fit_method}, model NOT in RAM)")
+        print(f"cpu threads for the fit: {torch.get_num_threads()} "
+              f"(raise/lower via --threads; 1-thread torch on a multi-core "
+              f"box is the classic slow-step culprit)", flush=True)
         os.makedirs(fit_dir, exist_ok=True)
         fit_sig = dict(fit_steps=args.fit_steps, fit_bs=args.fit_bs, fit_lr=args.fit_lr,
                        fit_method=args.fit_method, fit_jitter=args.fit_jitter,
                        fit_early_stop=args.fit_early_stop,
+                       muon_max_dim=args.muon_max_dim or MUON_NS_MAX_DIM,
+                       fit_autocast=args.fit_autocast,
+                       muon_ns_steps=args.muon_ns_steps,
+                       replace_router=bool(args.replace_router),
+                       norouter_hidden=args.norouter_hidden,
                        preset=fit_preset or "none")
         fit_meta_p = os.path.join(fit_dir, "fit_meta.json")
-        fit_done = all(os.path.isfile(os.path.join(fit_dir, f"fit_blk{i}.pt"))
-                       for i in range(n_blocks)) and os.path.isfile(fit_meta_p)
+        fit_done = fit_blocks_ok(fit_dir, n_blocks) and os.path.isfile(fit_meta_p)
         if fit_done:
             with open(fit_meta_p, encoding="utf-8") as f:
                 fit_done = json.load(f) == fit_sig
@@ -970,19 +1225,32 @@ def main():
                 Xi, Yi = load_pairs_block(pairs[i][0])
                 ini = torch.load(os.path.join(pool_dir, f"init_blk{i}.pt"),
                                  map_location="cpu")
-                fit_mod = FieldSparseMoe(ini["geom"], args.rank, gate_w=ini["gw"],
-                                         act_fn=act, gate_bias=ini.get("eb"),
-                                         shared=ini.get("shared")).to(device)
-                with torch.no_grad():
-                    fit_mod.wgud.copy_(ini["mgu"])
-                    fit_mod.wdnd.copy_(ini["mdn"])
-                mse = fit_field_module(fit_mod, Xi, Yi, args.fit_steps, args.fit_bs,
-                                       args.fit_lr, device,
-                                       log_prefix=f"block {i}/{n_blocks}",
-                                       guard=not args.skip_fit_guard,
-                                       method=args.fit_method, seed=5 + i,
-                                       jitter=args.fit_jitter,
-                                       early_stop=args.fit_early_stop)
+
+                def make_mod():
+                    """Fresh pristine module per attempt (a guard-failed
+                    attempt leaves the state dirty)."""
+                    fm = FieldSparseMoe(ini["geom"], args.rank, gate_w=ini["gw"],
+                                        act_fn=act, gate_bias=ini.get("eb"),
+                                        shared=ini.get("shared"),
+                                        mode="norouter" if args.replace_router else "router",
+                                        norouter_hidden=args.norouter_hidden).to(device)
+                    with torch.no_grad():
+                        fm.wgud.copy_(ini["mgu"])
+                        fm.wdnd.copy_(ini["mdn"])
+                    return fm
+
+                fit_mod, mse = fit_block_with_retry(
+                    fit_field_module, make_mod, Xi, Yi, args.fit_lr,
+                    args.fit_steps, args.fit_bs, device,
+                    log_prefix=f"block {i}/{n_blocks}",
+                    guard=not args.skip_fit_guard,
+                    method=args.fit_method, seed=5 + i,
+                    jitter=args.fit_jitter,
+                    early_stop=args.fit_early_stop,
+                    muon_max_dim=args.muon_max_dim or MUON_NS_MAX_DIM,
+                    log_every=args.fit_log_every,
+                    autocast=args.fit_autocast,
+                    muon_ns_steps=args.muon_ns_steps)
                 torch.save({n: getattr(fit_mod, n).detach().clone()
                             for n in fit_mod.field_names},
                            os.path.join(fit_dir, f"fit_blk{i}.pt"))
@@ -1063,7 +1331,9 @@ def main():
                                          map_location="cpu")
                         fm = FieldSparseMoe(ini["geom"], args.rank, gate_w=ini["gw"],
                                             act_fn=act, gate_bias=ini.get("eb"),
-                                            shared=ini.get("shared"))
+                                            shared=ini.get("shared"),
+                                            mode="norouter" if args.replace_router else "router",
+                                            norouter_hidden=args.norouter_hidden)
                         fit = torch.load(os.path.join(fit_dir, f"fit_blk{i}.pt"),
                                          map_location="cpu")
                         with torch.no_grad():
@@ -1155,19 +1425,28 @@ def main():
                                          map_location="cpu")
                         prev = torch.load(os.path.join(fit_dir, f"fit_blk{i}.pt"),
                                           map_location="cpu")
-                        fit_mod = FieldSparseMoe(ini["geom"], args.rank,
-                                                 gate_w=ini["gw"], act_fn=act,
-                                                 gate_bias=ini.get("eb"),
-                                                 shared=ini.get("shared"),
-                                                 init=prev).to(device)
-                        mse = fit_field_module(fit_mod, Xi, Yi, args.fit_steps,
-                                               args.fit_bs, args.fit_lr, device,
-                                               log_prefix=f"block {i}/{n_blocks} r{rnd}",
-                                               guard=not args.skip_fit_guard,
-                                               method=args.fit_method,
-                                               seed=1000 * rnd + 5 + i,
-                                               jitter=args.fit_jitter,
-                                               early_stop=args.fit_early_stop)
+                        def make_mod():
+                            return FieldSparseMoe(ini["geom"], args.rank,
+                                                  gate_w=ini["gw"], act_fn=act,
+                                                  gate_bias=ini.get("eb"),
+                                                  shared=ini.get("shared"),
+                                                  init=prev,
+                                                  mode="norouter" if args.replace_router else "router",
+                                                  norouter_hidden=args.norouter_hidden).to(device)
+
+                        fit_mod, mse = fit_block_with_retry(
+                            fit_field_module, make_mod, Xi, Yi, args.fit_lr,
+                            args.fit_steps, args.fit_bs, device,
+                            log_prefix=f"block {i}/{n_blocks} r{rnd}",
+                            guard=not args.skip_fit_guard,
+                            method=args.fit_method,
+                            seed=1000 * rnd + 5 + i,
+                            jitter=args.fit_jitter,
+                            early_stop=args.fit_early_stop,
+                            muon_max_dim=args.muon_max_dim or MUON_NS_MAX_DIM,
+                            log_every=args.fit_log_every,
+                            autocast=args.fit_autocast,
+                            muon_ns_steps=args.muon_ns_steps)
                         torch.save({n: getattr(fit_mod, n).detach().clone()
                                     for n in fit_mod.field_names},
                                    os.path.join(fit_dir, f"fit_blk{i}.pt"))
@@ -1214,11 +1493,18 @@ def main():
                        fit_preset=fit_preset or "none", fit_workers=args.fit_workers,
                        io_threads=args.io_threads,
                        prefetch=args.prefetch, io_cache=args.io_cache,
-                       per_layer_cap=args.per_layer_cap)
+                       per_layer_cap=args.per_layer_cap,
+                       muon_max_dim=args.muon_max_dim or MUON_NS_MAX_DIM,
+                       replace_router=bool(args.replace_router),
+                       norouter_hidden=args.norouter_hidden)
         write_field_artifact(src, out_dir, pool_dir, fit_dir, args.rank, dtype,
                              gguf=light_gguf, profile=profile,
-                             io_workers=args.io_threads, io_cache=args.io_cache)
-        full_b, field_b = field_accounting(geoms, args.rank)
+                             io_workers=args.io_threads, io_cache=args.io_cache,
+                             replace_router=args.replace_router,
+                             norouter_hidden=args.norouter_hidden)
+        full_b, field_b = field_accounting(
+            geoms, args.rank,
+            norouter_hidden=args.norouter_hidden if args.replace_router else None)
         T.update(rank=args.rank, full_experts_mb=full_b / 1e6, field_mb=field_b / 1e6,
                  ratio=full_b / max(field_b, 1), fit_mses=fit_mses,
                  cache_dir=pool_dir, fit_dir=fit_dir, phased_flow=True,

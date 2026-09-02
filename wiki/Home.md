@@ -19,6 +19,7 @@ smaller than the source Q4 GGUF (4.4 GB).
 | [Field-Engine](Field-Engine.md) | the method: formula, what is stored, why the router seed works, accounting |
 | [Pipeline-and-Stages](Pipeline-and-Stages.md) | the 9-stage auto pipeline, **stage toggles** (`--stages` / `--skip`), caches |
 | [Memory-and-Speed](Memory-and-Speed.md) | streaming, `--io-cache ram`, threads/prefetch/workers, disk layout |
+| [Colab](Colab.md) | the ready notebook: GPU runtime, Drive caching that kills re-downloads, hardware profiles |
 | [Quality-and-Calibration](Quality-and-Calibration.md) | the KL protocol, style-drift findings, temperature calibration, min-p, refine |
 | [Router-Diagnostics](Router-Diagnostics.md) | `router_audit.py` (3 phases), `router_ft.py` gate calibration, `field_dims.py` |
 | [Research-History](Research-History.md) | the experiment ladder that led to the field, **with all charts** |

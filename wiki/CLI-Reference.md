@@ -39,9 +39,10 @@ same table from the tool.
 | flag | default | meaning |
 |---|---|---|
 | `--device` | `auto` | `auto` / `cuda` / `cpu` |
-| `--dtype` | `auto` → bfloat16 | `bfloat16` / `float16` / `float32` |
+| `--dtype` | `auto` → bfloat16 (float16 on pre-Ampere GPUs) | `bfloat16` / `float16` / `float32` |
 | `--threads` | all cores | limit torch CPU threads (e.g. `4` keeps the machine responsive) |
 | `--low-mem` | off | halve pair/chunk caps for the metric passes (lower RAM, ~same metrics) |
+| `--profile` | `auto` | hardware profile: `low` = weak-PC defaults, `high` = lift limits (io-cache ram, io-threads 4, calib-bsz 16 on GPU); `auto` = `high` when CUDA present or ≥32 GB RAM + ≥8 cores, else `low`. Explicit `--io-cache`/`--io-threads` win. See [Colab](Colab.md) |
 
 ### Texts & calibration
 
@@ -75,9 +76,9 @@ same table from the tool.
 
 | flag | default | meaning |
 |---|---|---|
-| `--io-threads` | `1` | GGUF dequant threads for expert tensors (2-4 on multi-core) |
+| `--io-threads` | auto: `4` on the high profile, else `1` | GGUF dequant threads for expert tensors (2-4 on multi-core) |
 | `--prefetch` | `1` | background dequant of the next expert block (0 = off, saves ~1 block of RAM) |
-| `--io-cache` | `disk` | `ram` = keep packed GGUF tensors in RAM (huge win on Colab/Drive/HDD) |
+| `--io-cache` | auto: `ram` when enough free RAM, else `disk` | `ram` = keep packed GGUF tensors in RAM (huge win on Colab/Drive/HDD); auto downgrades to `disk` if the packed file + ~5 GB margin does not fit |
 | `--full-dequant` | off | build the ~14 GB HF checkpoint (old path; default reads the GGUF directly) |
 | `--keep-dequant` | off | keep that checkpoint after success (default: deletes itself) |
 | `--max-shard` | `4GB` | artifact safetensors shard size |

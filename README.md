@@ -262,6 +262,7 @@ python3 hf_pipeline.py --gguf /path/model.Q4_K_M.gguf   # the GGUF is already do
 python3 hf_pipeline.py --rank 16                  # more aggressive (r=32 by default)
 python3 hf_pipeline.py --calib-dataset wikitext-2-raw-v1   # better calibration (needs datasets)
 python3 hf_pipeline.py --fit-steps 800            # longer fit - a more precise field
+python3 hf_pipeline.py --fit-log-every 25         # see the mse every 25 steps (+ s/step, ETA)
 python3 hf_pipeline.py --low-mem --threads 4      # gentle mode
 python3 hf_pipeline.py --skip-reload-check        # skip the final reload check
 python3 hf_pipeline.py --smoke                    # quick wiring check
@@ -269,30 +270,108 @@ python3 hf_pipeline.py --smoke                    # quick wiring check
 
 ### Fit methods (types of refinement)
 
-The fit accepts several optimizer kinds - `--fit-method`:
+The fit accepts several optimizer kinds - `--fit-method`.
+**Muon is the default since 2026-09-02.1** (user measurements on the toy
+setup: the same quality in ~half the Adam steps - the field params are
+matrices, and Muon's orthogonalized Newton-Schulz update matches that
+geometry; lr peak ~0.003-0.005):
 
 | method | what it is |
 |---|---|
-| `adam` | plain Adam, constant lr - the classic default |
+| `muon` | **default**: momentum + Newton-Schulz orthogonalized update on the matrix params (flat x1.0 update scale since 2026-09-02.2 - the lr is the lr you measured); on CPU the full-size centroids (min-dim > `--muon-max-dim`, default 512) take a paired Adam - NS is quadratic in min(m,n) |
+| `muon-cosine` | Muon + cosine lr decay to ~0 |
+| `adam` | plain Adam, constant lr - the classic baseline (rollback) |
 | `adamw` | AdamW with a small weight decay (less drift in U,V) |
-| `adam-cosine` | Adam + cosine lr decay to ~0 - usually the best final mse |
+| `adam-cosine` | Adam + cosine lr decay to ~0 - the pre-Muon default |
 | `rmsprop` | RMSProp - an alternative for unstable blocks |
 
 And presets - `--fit-preset` (explicit flags always win):
 
 | preset | steps | batch | lr | method |
 |---|---|---|---|---|
-| `fast` | 120 | 4096 | 3e-3 | adam-cosine |
-| `balanced` | 300 | 4096 | 2e-3 | adam-cosine |
-| `quality` | 600 | 8192 | 2e-3 | adam-cosine |
+| `fast` | 120 | 4096 | 4e-3 | muon |
+| `balanced` | 300 | 4096 | 4e-3 | muon |
+| `quality` | 600 | 8192 | 3e-3 | muon |
 
-No preset = the legacy defaults (300/4096/2e-3/adam). The fit cache signature
-includes method+preset, so changing them triggers a re-fit automatically
-(the calibration pool is NOT re-run - stages 1-4 stay cached).
+No preset = the defaults (300/4096/4e-3/muon). On a GPU pass
+`--muon-max-dim 4096` to cover the centroids with Muon too. The fit cache
+signature includes method+preset, so changing them triggers a re-fit
+automatically (the calibration pool is NOT re-run - stages 1-4 stay cached).
+
+Fit resilience and visibility (2026-09-02.2): a block whose fit DIVERGES
+("loss diverged ... biggest moves: ... x1.83" - the biggest moved parameters
+are printed, the prime suspect of a random-walking fit) and cannot ship a
+real improvement trips the FIT GUARD and is automatically retried ONCE at
+lr/2; a second failure stops the run. A WEAK but non-diverged fit (<2% below
+the centroid baseline) ships with a loud WARNING instead of crashing the run
+(the number is recorded in mse.json / the report either way). The classic
+degenerate-fit check (coordinates staying exactly zero) remains a hard error.
+`--fit-log-every 25` prints the mse every 25 steps (default 100); every step
+line carries `s/step` and an ETA so silence never looks like a hang.
 
 `--fit-jitter 0.3` adds Gaussian noise to the fit inputs (in per-dim std
 units, targets stay exact) - a cheap augmentation for a small calibration
 pool; at low points-per-dimension it beats extra rank/steps.
+
+### Fit step speed: bf16 autocast + NS steps (2026-09-02.3 / .4)
+
+Where a fit step goes (profiled at bs 4096, muon split 7 NS + 1 adam):
+~85% forward/backward matmuls, ~9% Newton-Schulz, ~2% the paired Adam -
+"muon is slow" is really "fp32 matmuls are slow" (muon adds only ~10% over
+an adam step). Since 2026-09-02.3 the per-step forward runs under
+`torch.autocast(bfloat16)`: the params and ALL optimizer state stay fp32,
+the loss is computed on `out.float()` - only the matmuls switch dtype.
+On AMX / AVX512-BF16 CPUs (and on GPUs) that is 1.8-2.8x per step with
+measured-identical quality (synthetic block, 150 steps, 2 seeds: best-ema
+0.06008 fp32 vs 0.06005 bf16 and 0.06051 vs 0.06050; no divergences).
+
+- `--fit-autocast auto` (default, DECIDED BY A REAL-STEP PROBE since
+  2026-09-02.4): before the fit starts, the pipeline times ~8 REAL fit
+  steps in fp32 and in bf16 (one-time per geometry) and keeps bf16 only
+  where the FULL step - matmuls + weight casts + backward - is >=1.2x
+  faster. The 2026-09-02.3 decision used a single big-matmul probe and
+  could enable bf16 where the real step is net slower (a measured "8.2 got
+  SLOWER than 8.1" report); the real-step probe cannot be fooled that way,
+  and its measured seconds are printed in the muon-split line for audit.
+  The probe restores the initial parameters, clears optimizer state and
+  uses a local RNG, so the fit trajectory is bit-identical to a no-probe
+  run. `bf16` / `fp32` force either side (no probe). The --fit-autocast
+  string is part of the fit cache signature (changing it re-fits; stages
+  1-4 stay cached); switching patch 8.2 -> 8.3 does NOT change the
+  signature, so already-fitted 8.2 blocks stay valid.
+- `--muon-ns-steps 3`: fewer Newton-Schulz iterations - ~40% of the NS time
+  saved at <=0.5% best-ema cost; relevant on slow CPUs where NS is visible.
+- The STAGE 5 banner prints the torch thread count. If steps crawl at
+  N s/step on a multi-core box, check that line: 1-thread torch is the
+  classic culprit (`--threads` lifts it), and `--fit-workers 2` trades
+  per-step speed for fitting two blocks at once.
+- Wall-time math: a muon step costs ~10% more than an adam step but needs
+  ~half as many for the same mse - muon stays the fast option, and autocast
+  widens the gap.
+
+### Replace the router (FieldNoRouter, EXPERIMENTAL, opt-in)
+
+`--replace-router` (2026-09-02.1) fits and deploys the field WITHOUT the
+discrete router: the movement coordinates come from a smooth direct map
+g(x) - linear by default, or a one-GELU-hidden MLP with
+`--norouter-hidden 256`. Motivation (the 2026-09-02 toy verdict): the
+router coordinates c(z) are piecewise-constant, and top-k boundaries make
+them DISCONTINUOUS - a token near a boundary flips experts on a tiny
+perturbation ("lost connections"); a smooth g(x) removes the boundary
+effect by construction.
+
+- The artifact stays a normal HF model: `modeling_field.py` gets a
+  self-contained no-router runtime appended, and the block class is chosen
+  by `config.field.router_mode` (base artifacts are byte-compatible -
+  without the flag nothing changes).
+- The unused frozen router weight is not written into the artifact.
+- Budget note: in norouter mode the coordinates depend on trainable params,
+  so the per-step precomputed-routing fast path does not apply (the fit is
+  somewhat slower per step).
+- Example: `python3 hf_pipeline.py --replace-router` (linear),
+  `python3 hf_pipeline.py --replace-router --norouter-hidden 256` (MLP).
+- Compare against the router field on the same pool:
+  `--stages fit --fit-method adam-cosine` vs `--fit-method muon` etc.
 
 ### Tuning on a real model (first-run findings)
 
@@ -344,7 +423,8 @@ Implemented optimizations:
 - `--prefetch 1` (default) - a background thread dequantizes the NEXT expert
   block while the current layer computes. `--prefetch 0` - synchronous
   (+~1 block of RAM saved).
-- `--io-cache ram` (default `disk`) - copies the RAW PACKED GGUF tensors into
+- `--io-cache ram` (default: auto - `ram` when enough free RAM, else `disk`) -
+  copies the RAW PACKED GGUF tensors into
   RAM on first touch (lazily, tensor by tensor; total ~= the packed file
   size, e.g. ~2.7 GB for a 1B Q8_0 MoE). The cache is process-wide and shared
   by every streaming pass, so the calibration-pool collection, a refit pass
@@ -354,8 +434,23 @@ Implemented optimizations:
   file read replaces thousands of small random ones. On a machine where RAM
   is too tight even for the packed file, stay on `disk` (prefetch +
   io-threads still help).
+- `--profile auto|low|high` (default `auto`) - the weak-PC limits are lifted
+  automatically on stronger hardware: CUDA present (or >= 32 GB RAM + >= 8
+  cores) -> `high`: io-cache ram, io-threads 4, calib-bsz 16 on GPU, and
+  fp16 on pre-Ampere GPUs (a T4 has no native bf16). `low` (or `--low-mem`)
+  keeps the historical behavior, so 8 GB machines are unaffected. The
+  resolved profile is printed in the `hardware:` line at startup.
+- GPU: `--device auto` runs the whole streaming path on cuda:0 when a GPU is
+  present (backbone + one expert block in VRAM at a time); the fit uses it
+  as before.
 - The pool cache makes re-runs (new rank, new fit settings) skip stages 1-4
   entirely.
+
+Google Colab: the ready notebook `moe_router_colab.ipynb` (in this folder)
+does the full loop - T4 GPU runtime, GGUF downloaded ONCE into an HF cache
+on Drive (`HF_HOME` -> Drive), pool cache and artifact synced to Drive, so a
+reconnect skips the download and stages 1-4 entirely. Same plain
+`hf_pipeline.py` command inside, no adaptation. Details: `wiki/Colab.md`.
 
 Colab note: put the GGUF on the LOCAL disk (`/content`), not a Drive mount -
 a Drive FUSE mount turns every small read into a network round-trip. Then

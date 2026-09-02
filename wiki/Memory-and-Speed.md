@@ -18,12 +18,31 @@ Knobs:
 
 - `--prefetch 0` — disable the background reader (saves ~1 block of RAM);
 - `--io-threads 2..4` — parallel dequant threads for the expert tensors
-  (faster block loads on multi-core CPUs);
+  (faster block loads on multi-core CPUs; default: auto, 4 on the high
+  profile);
 - `--io-cache ram` — copy the packed GGUF tensors into RAM on first touch
   (~= packed file size). Every later pass (pool collection, refits, artifact
   write) then reads **nothing from disk** — the big win on Colab/Drive or an
   HDD. A process-wide cache shared by all passes; correctness is covered by
-  `test_io_cache.py` / `test_io_cache_stream.py`.
+  `test_io_cache.py` / `test_io_cache_stream.py`. Default: auto — `ram` when
+  enough free RAM, else `disk` (see profiles below).
+
+## Hardware profiles (`--profile auto|low|high`)
+
+The historical defaults are tuned for an 8 GB weak PC. On a stronger box
+they leave speed on the table, so the pipeline resolves a profile at
+startup (printed in the `hardware:` line):
+
+- `low` — the weak-PC defaults, unchanged (io-cache disk, 1 io thread);
+- `high` — CUDA present, or >= 32 GB RAM + >= 8 cores: `io-cache ram`,
+  `io-threads 4`, `calib-bsz 16` on GPU, and **fp16 on pre-Ampere GPUs**
+  (a T4 has no native bf16 — emulated and slow; `auto` dtype flips to
+  `float16` there);
+- `auto` (default) — `high` when the machine qualifies, else `low`.
+
+The GPU is used by the whole streaming path: backbone and expert blocks sit
+on cuda:0 during their layer's pass. Explicit `--io-cache / --io-threads`
+flags always beat the profile boosts; `--low-mem` caps still apply on top.
 
 ## Disk layout (OLMoE Q4_K_M)
 
@@ -76,4 +95,6 @@ comfortable end-to-end.
 
 The HF cache is redirected **into the project** (`hf_env.py`, imported
 first everywhere), so nothing lands on the system drive — relevant for
-Colab and shared machines. See `hf_cache/` in the project root.
+Colab and shared machines. See `hf_cache/` in the project root. On Colab,
+`HF_HOME` exported to a Drive folder keeps every download across sessions —
+see [Colab](Colab.md).
