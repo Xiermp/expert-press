@@ -222,3 +222,77 @@ watchdog fires and clears the process-wide raw cache; refine_flush_at).
 Regression: test_update10_speed.py 11/11, test_update9_router_guard.py
 11/11. Live e2e on tiny.gguf with a refine round: PIPELINE FINISHED, the
 low-RAM flush branch and the capture progress line both exercised.
+
+----
+
+# 2026-09-05.3 - FIELD RUNTIME FIX (hy_v3): build 10.5
+
+Files changed: `modeling_field_template.py` (version stamp 2026-09-05.3),
+new `test_template_hy_v3.py` (18 checks), new
+`modeling_field_HYV3_ready.py` (pre-rendered drop-in), README bullet.
+
+## Context
+User report (evening 2026-09-05): the first full NanoColibri (hy_v3) run
+finished Stage 5 refine + Stage 6 save, then Stage 7 crashed:
+`TypeError: HYV3TopKRouter.forward() missing 1 required positional argument:
+'e_score_correction_bias'` inside the artifact's `modeling_field.py`, with
+`shared_experts.*` and `e_score_correction_bias` reported UNEXPECTED in the
+load report. Root cause: the artifact template was written and A/B-tested on
+the OLMoE toy only. It never grew the hy_v3 branches that the fit side
+(`hf_field_transform.FieldSparseMoe`) has had all along:
+
+1. `self.gate(x)` - since transformers 5.16 the hy_v3 router takes the
+   selection bias as a forward argument (`forward(x, e_score_correction_bias)`,
+   the router no longer owns it); the template call crashed before any return
+   handling. The fit side already called `gate(x, eb)` - Stage 5 numbers were
+   computed with the bias, the artifact could never reproduce them.
+2. No `e_score_correction_bias` buffer and no `shared_experts` module in the
+   artifact class - Stage 6 (correctly) copies both from the backbone into
+   the artifact, so they loaded as UNEXPECTED dead weight, and the artifact
+   silently LOST the always-on shared-expert branch (the fit target is
+   "block output minus shared", so the field must be summed WITH shared) and
+   routed without the bias.
+3. Latent `NameError`: the template's `forward` referenced the `fi` local
+   from `__init__` in the non-tuple router branch (any Linear-gate base
+   model would crash there; never triggered on the toy).
+
+## What was done (toy/unit stand FIRST, then the package)
+- `modeling_field_template.py`: for `router_kind == "sigmoid_bias"` (or when
+  the host router's signature takes the bias - sniffed at runtime, with a
+  `TypeError` fallback call for older hosts) the class registers the
+  `e_score_correction_bias` buffer (filled from the checkpoint) and passes it
+  to the router; for `dff_shexp > 0` it builds a `shared_experts` module with
+  the SAME key layout as the base model (`gate_proj/up_proj/down_proj`,
+  bias-free) and adds its output to the field output in fp32 - exactly the
+  base model's `enable_moe_fp32_combine` semantics and exactly what the fit
+  measured. Top-k weights from v5 routers are taken as returned (already
+  normalized and scaled inside the router - same contract as the fit side).
+  The `fi` NameError is fixed (top_k/norm_topk stored as attributes).
+- `modeling_field_HYV3_ready.py`: the template pre-rendered for
+  HYV3ForCausalLM/HYV3TopKRouter - a drop-in replacement for the modeling
+  file of an EXISTING artifact, so the finished r128 run does NOT need the
+  hours-long refine re-run; `--stages verify` then re-checks the artifact.
+
+## Tests (new `test_template_hy_v3.py`, 18/18)
+- real HYV3TopKRouter: buffer + shared_experts registered; forward finite;
+  perturbing the bias changes expert selection (buffer is actually used).
+- shared branch == base HYV3MLP (same weights -> same output).
+- artifact math == fit-side `FieldSparseMoe` on identical params
+  (max|d| = 3e-08).
+- mini-e2e on a REAL HYV3ForCausalLM (2 layers, 8 experts, 1 shared):
+  save_pretrained + modeling_field.py -> from_pretrained(trust_remote_code)
+  -> loading_info missing/unexpected EMPTY, logits identical after reload.
+- OLMoE regression: no bias/shared on the softmax path; tuple-router ok;
+  Linear-gate (the old NameError branch) ok; norm_topk ok.
+- Live e2e tiny.gguf --smoke --refine-rounds 1: PIPELINE FINISHED 11.6 s,
+  artifact reload verified (KL -0.001 bits, +0.0%). Regression suites:
+  test_lowram_fix.py 50/50, test_update9_router_guard.py 11/11,
+  test_update10_speed.py 11/11.
+
+## How to apply (finished artifacts, no refit needed)
+- A (30 s): overwrite the artifact's modeling file with the pre-rendered
+  `modeling_field_HYV3_ready.py`, then `--stages verify`.
+- B (minutes): re-run the same command with `--refine-rounds 0` - the fits
+  are cached (fit_sig unchanged), Stage 6 rebuilds the artifact with the new
+  template, Stage 7 verifies. Without `--refine-rounds 0` the refine round
+  repeats (it has no skip marker - its pairs are deliberately rebuilt).

@@ -265,6 +265,18 @@ ppl from the cache without the model).
   crosses 0.6 GB, before the thrash starts (`MOE_NO_RAM_WATCHDOG=1` off);
   the refine capture pass flushes pair chunks at a RAM-adaptive threshold
   and prints a per-window progress line so a stall is visible.
+- **hy_v3 artifacts now load and run** (2026-09-05.3, build 10.5): the first
+  full NanoColibri run hit `HYV3TopKRouter.forward() missing 1 required
+  positional argument: 'e_score_correction_bias'` in Stage 7, and the load
+  report flagged `shared_experts.*` / `e_score_correction_bias` as UNEXPECTED.
+  The artifact runtime template was OLMoE-only; it now (a) passes the routing
+  bias to the router (sniffed from the host's signature, with a fallback call
+  for older transformers), (b) ships the always-on `shared_experts` branch and
+  sums it with the field output in fp32 - the same math the fit measured - and
+  (c) fixes a latent NameError in the Linear-gate branch. Existing artifacts
+  need NO refit: overwrite their `modeling_field.py` with the pre-rendered
+  `modeling_field_HYV3_ready.py` and re-verify (`--stages verify`), or re-run
+  with `--refine-rounds 0` to rebuild the artifact from the cached fits.
 - Centroids accumulate over chunks (no full fp32 expert stack: -2 GB peak per
   block).
 - `--low-mem` - a memory-frugal metrics mode: pair/chunk caps halved (lower

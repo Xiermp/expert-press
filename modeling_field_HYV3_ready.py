@@ -1,3 +1,4 @@
+# ГОТОВЫЙ ФАЙЛ - см. шапку ниже.
 """Рантайм "поле-движка" — ОБЫЧНАЯ HF-модель, загружается стандартно:
     AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)
     (рекомендуется dtype="bfloat16", low_cpu_mem_usage=True)
@@ -29,8 +30,8 @@ import inspect
 
 import torch
 import torch.nn as nn
-from transformers import @@BASE@@
-from @@ROUTER_MOD@@ import @@ROUTER@@
+from transformers import HYV3ForCausalLM
+from transformers.models.hy_v3.modeling_hy_v3 import HYV3TopKRouter
 from transformers.activations import ACT2FN
 
 
@@ -43,7 +44,7 @@ class FieldSparseMoe(nn.Module):
         d, dff, r = fi["d_model"], fi["d_ff"], fi["rank"]
         self.top_k = int(fi["top_k"])
         self.norm_topk = bool(fi.get("norm_topk"))
-        self.gate = @@ROUTER@@(config)                 # роутер не трогаем (вес из базы)
+        self.gate = HYV3TopKRouter(config)                 # роутер не трогаем (вес из базы)
         self.act_fn = ACT2FN[config.hidden_act]
         # hy_v3: bias выбора в 5.16+ - аргумент forward(x, bias), на старых
         # билдах он внутри роутера. Определяем по фактической сигнатуре хоста
@@ -105,7 +106,7 @@ class FieldSparseMoe(nn.Module):
         return y.view(B, T, -1)
 
 
-class FieldForCausalLM(@@BASE@@):
+class FieldForCausalLM(HYV3ForCausalLM):
     """Базовая архитектура, где каждый MoE-блок заменён на поле."""
 
     def __init__(self, config):
