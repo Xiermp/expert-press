@@ -228,6 +228,43 @@ ppl from the cache without the model).
   stages 1-4 entirely (calibration = a pool of activation vectors, order and
   text do not matter). A specific rank's fit is cached separately
   (`cache_<model>/fit_r<rank>/`).
+- **Interrupted runs resume** (2026-09-04.3): a kill at ANY point - during
+  the base log-prob pass, the stage-4 init loop, or mid-fit - loses nothing
+  that was already written. The next run reuses the pair pool (never
+  re-collected), rebuilds only the missing `init_blk*.pt` (per block, with
+  progress prints), re-fits only the blocks without a valid `fit_blk*.pt`
+  (`fit resume: K/N blocks already fitted`), and recomputes only the missing
+  `lp_XXX.pt` chunks. All cache files are written atomically. A pool left
+  orphaned by a pre-.3 interrupted run (no art_meta.json) is adopted
+  automatically. To force a clean recalibration instead, delete
+  `results/cache_<model>/`.
+- **A smaller cached pool is kept by default** (2026-09-05.1): if the pool on
+  disk holds fewer pairs/block than the requested `--per-layer-cap` (e.g. you
+  raised cap 49152 -> 65536), the run no longer forces the most expensive
+  re-collection - it keeps the cached pool when it is still usable
+  (>= max(4096, 16*rank, cap/2) pairs/block) and prints a one-line notice
+  (49k pairs at rank 128 = 384 pairs/dim is already ample). Pass
+  `--pool-recalibrate` to restore the old forced re-collection. This also
+  removes the OOM loop on low-RAM boxes, where the re-collection was the
+  thing that died (and made every restart look like "nothing was saved").
+- **OOM with `--io-cache ram` degrades instead of dying** (2026-09-05.1):
+  when a block load fails to allocate (ram cache + backbone + dequant
+  scratch > free RAM), the packed-GGUF RAM copy (~= the file size) is
+  dropped, prefetch is disabled, and the run continues from disk/mmap with a
+  notice - instead of the previous hard `Unable to allocate ... MiB` crash.
+  The dequant itself now also peaks at (output + ~4 MB slab) instead of
+  2-3 full-size intermediates (bit-identical output). On boxes with <6-8 GB
+  free RAM, `--io-cache disk` is still the recommended explicit choice.
+- **Swap-storm guard** (2026-09-05.2): low RAM does not always produce a
+  clean MemoryError - Windows may slide into a swap-storm where allocations
+  succeed but everything crawls (seen in the wild: a refine round frozen at
+  "13 block loads" with no error). Now every streaming stage re-checks the
+  io-cache ram request against CURRENT free RAM (1.5x the packed GGUF + 1 GB
+  headroom) and falls back to disk with a notice (`MOE_FORCE_IO_RAM=1`
+  overrides); a watchdog thread drops the ram cache as soon as free RAM
+  crosses 0.6 GB, before the thrash starts (`MOE_NO_RAM_WATCHDOG=1` off);
+  the refine capture pass flushes pair chunks at a RAM-adaptive threshold
+  and prints a per-window progress line so a stall is visible.
 - Centroids accumulate over chunks (no full fp32 expert stack: -2 GB peak per
   block).
 - `--low-mem` - a memory-frugal metrics mode: pair/chunk caps halved (lower
@@ -262,116 +299,42 @@ python3 hf_pipeline.py --gguf /path/model.Q4_K_M.gguf   # the GGUF is already do
 python3 hf_pipeline.py --rank 16                  # more aggressive (r=32 by default)
 python3 hf_pipeline.py --calib-dataset wikitext-2-raw-v1   # better calibration (needs datasets)
 python3 hf_pipeline.py --fit-steps 800            # longer fit - a more precise field
-python3 hf_pipeline.py --fit-log-every 25         # see the mse every 25 steps (+ s/step, ETA)
 python3 hf_pipeline.py --low-mem --threads 4      # gentle mode
 python3 hf_pipeline.py --skip-reload-check        # skip the final reload check
 python3 hf_pipeline.py --smoke                    # quick wiring check
+python3 hf_pipeline.py --refresh-init             # rebuild the SVD init files for an existing pool, then exit
+python3 hf_pipeline.py --fit-method muon-cosine   # Muon on the U/V factors
+python3 hf_pipeline.py --fit-autocast off         # force fp32 matmuls (the probe keeps fp32 automatically when bf16 is slower)
 ```
 
 ### Fit methods (types of refinement)
 
-The fit accepts several optimizer kinds - `--fit-method`.
-**Muon is the default since 2026-09-02.1** (user measurements on the toy
-setup: the same quality in ~half the Adam steps - the field params are
-matrices, and Muon's orthogonalized Newton-Schulz update matches that
-geometry; lr peak ~0.003-0.005):
+The fit accepts several optimizer kinds - `--fit-method`:
 
 | method | what it is |
 |---|---|
-| `muon` | **default**: momentum + Newton-Schulz orthogonalized update on the matrix params (flat x1.0 update scale since 2026-09-02.2 - the lr is the lr you measured); on CPU the full-size centroids (min-dim > `--muon-max-dim`, default 512) take a paired Adam - NS is quadratic in min(m,n) |
-| `muon-cosine` | Muon + cosine lr decay to ~0 |
-| `adam` | plain Adam, constant lr - the classic baseline (rollback) |
+| `adam` | plain Adam, constant lr - the classic default |
 | `adamw` | AdamW with a small weight decay (less drift in U,V) |
-| `adam-cosine` | Adam + cosine lr decay to ~0 - the pre-Muon default |
+| `adam-cosine` | Adam + cosine lr decay to ~0 - usually the best final mse |
 | `rmsprop` | RMSProp - an alternative for unstable blocks |
+| `muon` | BY-NAME split: U*/V* factors get Muon's NS-orthogonalized updates, everything else (centroids, coordinates C, router) stays Adam |
+| `muon-cosine` | muon + cosine lr decay |
 
 And presets - `--fit-preset` (explicit flags always win):
 
 | preset | steps | batch | lr | method |
 |---|---|---|---|---|
-| `fast` | 120 | 4096 | 4e-3 | muon |
-| `balanced` | 300 | 4096 | 4e-3 | muon |
-| `quality` | 600 | 8192 | 3e-3 | muon |
+| `fast` | 120 | 4096 | 3e-3 | adam-cosine |
+| `balanced` | 300 | 4096 | 2e-3 | adam-cosine |
+| `quality` | 600 | 8192 | 2e-3 | adam-cosine |
 
-No preset = the defaults (300/4096/4e-3/muon). On a GPU pass
-`--muon-max-dim 4096` to cover the centroids with Muon too. The fit cache
-signature includes method+preset, so changing them triggers a re-fit
-automatically (the calibration pool is NOT re-run - stages 1-4 stay cached).
-
-Fit resilience and visibility (2026-09-02.2): a block whose fit DIVERGES
-("loss diverged ... biggest moves: ... x1.83" - the biggest moved parameters
-are printed, the prime suspect of a random-walking fit) and cannot ship a
-real improvement trips the FIT GUARD and is automatically retried ONCE at
-lr/2; a second failure stops the run. A WEAK but non-diverged fit (<2% below
-the centroid baseline) ships with a loud WARNING instead of crashing the run
-(the number is recorded in mse.json / the report either way). The classic
-degenerate-fit check (coordinates staying exactly zero) remains a hard error.
-`--fit-log-every 25` prints the mse every 25 steps (default 100); every step
-line carries `s/step` and an ETA so silence never looks like a hang.
+No preset = the legacy defaults (300/4096/2e-3/adam). The fit cache signature
+includes method+preset, so changing them triggers a re-fit automatically
+(the calibration pool is NOT re-run - stages 1-4 stay cached).
 
 `--fit-jitter 0.3` adds Gaussian noise to the fit inputs (in per-dim std
 units, targets stay exact) - a cheap augmentation for a small calibration
 pool; at low points-per-dimension it beats extra rank/steps.
-
-### Fit step speed: bf16 autocast + NS steps (2026-09-02.3 / .4)
-
-Where a fit step goes (profiled at bs 4096, muon split 7 NS + 1 adam):
-~85% forward/backward matmuls, ~9% Newton-Schulz, ~2% the paired Adam -
-"muon is slow" is really "fp32 matmuls are slow" (muon adds only ~10% over
-an adam step). Since 2026-09-02.3 the per-step forward runs under
-`torch.autocast(bfloat16)`: the params and ALL optimizer state stay fp32,
-the loss is computed on `out.float()` - only the matmuls switch dtype.
-On AMX / AVX512-BF16 CPUs (and on GPUs) that is 1.8-2.8x per step with
-measured-identical quality (synthetic block, 150 steps, 2 seeds: best-ema
-0.06008 fp32 vs 0.06005 bf16 and 0.06051 vs 0.06050; no divergences).
-
-- `--fit-autocast auto` (default, DECIDED BY A REAL-STEP PROBE since
-  2026-09-02.4): before the fit starts, the pipeline times ~8 REAL fit
-  steps in fp32 and in bf16 (one-time per geometry) and keeps bf16 only
-  where the FULL step - matmuls + weight casts + backward - is >=1.2x
-  faster. The 2026-09-02.3 decision used a single big-matmul probe and
-  could enable bf16 where the real step is net slower (a measured "8.2 got
-  SLOWER than 8.1" report); the real-step probe cannot be fooled that way,
-  and its measured seconds are printed in the muon-split line for audit.
-  The probe restores the initial parameters, clears optimizer state and
-  uses a local RNG, so the fit trajectory is bit-identical to a no-probe
-  run. `bf16` / `fp32` force either side (no probe). The --fit-autocast
-  string is part of the fit cache signature (changing it re-fits; stages
-  1-4 stay cached); switching patch 8.2 -> 8.3 does NOT change the
-  signature, so already-fitted 8.2 blocks stay valid.
-- `--muon-ns-steps 3`: fewer Newton-Schulz iterations - ~40% of the NS time
-  saved at <=0.5% best-ema cost; relevant on slow CPUs where NS is visible.
-- The STAGE 5 banner prints the torch thread count. If steps crawl at
-  N s/step on a multi-core box, check that line: 1-thread torch is the
-  classic culprit (`--threads` lifts it), and `--fit-workers 2` trades
-  per-step speed for fitting two blocks at once.
-- Wall-time math: a muon step costs ~10% more than an adam step but needs
-  ~half as many for the same mse - muon stays the fast option, and autocast
-  widens the gap.
-
-### Replace the router (FieldNoRouter, EXPERIMENTAL, opt-in)
-
-`--replace-router` (2026-09-02.1) fits and deploys the field WITHOUT the
-discrete router: the movement coordinates come from a smooth direct map
-g(x) - linear by default, or a one-GELU-hidden MLP with
-`--norouter-hidden 256`. Motivation (the 2026-09-02 toy verdict): the
-router coordinates c(z) are piecewise-constant, and top-k boundaries make
-them DISCONTINUOUS - a token near a boundary flips experts on a tiny
-perturbation ("lost connections"); a smooth g(x) removes the boundary
-effect by construction.
-
-- The artifact stays a normal HF model: `modeling_field.py` gets a
-  self-contained no-router runtime appended, and the block class is chosen
-  by `config.field.router_mode` (base artifacts are byte-compatible -
-  without the flag nothing changes).
-- The unused frozen router weight is not written into the artifact.
-- Budget note: in norouter mode the coordinates depend on trainable params,
-  so the per-step precomputed-routing fast path does not apply (the fit is
-  somewhat slower per step).
-- Example: `python3 hf_pipeline.py --replace-router` (linear),
-  `python3 hf_pipeline.py --replace-router --norouter-hidden 256` (MLP).
-- Compare against the router field on the same pool:
-  `--stages fit --fit-method adam-cosine` vs `--fit-method muon` etc.
 
 ### Tuning on a real model (first-run findings)
 
@@ -433,7 +396,9 @@ Implemented optimizations:
   storage (Google Colab disks, Google Drive mounts, HDDs): one sequential
   file read replaces thousands of small random ones. On a machine where RAM
   is too tight even for the packed file, stay on `disk` (prefetch +
-  io-threads still help).
+  io-threads still help). An explicit `ram` that does not fit is downgraded
+  to disk per stage with a notice (see the swap-storm guard above);
+  `MOE_FORCE_IO_RAM=1` forces it anyway.
 - `--profile auto|low|high` (default `auto`) - the weak-PC limits are lifted
   automatically on stronger hardware: CUDA present (or >= 32 GB RAM + >= 8
   cores) -> `high`: io-cache ram, io-threads 4, calib-bsz 16 on GPU, and
@@ -612,7 +577,7 @@ see `modeling_field.py`).
 | `modeling_field_template.py` | the template of the artifact's modeling code |
 | `step1_compress.bat` / `step2_chat.bat` | double-click launchers on Windows |
 | `make_tiny_olmoe_gguf.py` / `make_tiny_hyv3_gguf.py` | mini-GGUF generators (environment check without a 4 GB download) |
-| `test_stream_mode.py`, `test_gguf_direct.py`, `test_field_fit_guard.py`, `test_io_cache.py`, `test_io_cache_stream.py` | A/B tests (bit-exact streaming vs full model; GGUF vs checkpoint; fit guard; `--io-cache ram` correctness) |
+| `test_stream_mode.py`, `test_gguf_direct.py`, `test_field_fit_guard.py`, `test_io_cache.py`, `test_io_cache_stream.py`, `test_lowram_fix.py` | A/B tests (bit-exact streaming vs full model; GGUF vs checkpoint; fit guard; `--io-cache ram` correctness; LOW-RAM FIX + swap-storm guard: memory-safe dequant, keep-smaller pool, OOM degrade, runner ram-fit re-check, watchdog) |
 | `run_pipeline.sh` + `pipeline.py`, `common.py`, `train.py`, `transform_eval.py`, `variants_eval.py`, `upgrade_eval.py`, `bank_eval.py`, `masks_eval.py`, `field_eval.py`, `deploy.py`, `verify_transformed.py` | toy pipeline: trains a mini-MoE, compresses it, compares against baselines (SVD/PQ/BitDelta/dense) |
 | `examples/toy_report/` | mini-PoC reports and numbers |
 | `wiki/` | the project wiki (method, pipeline, quality findings, research history with charts, CLI reference) |
@@ -655,3 +620,123 @@ coordinates cannot remain exactly zero. Otherwise the run FAILS with a clear
 error (previously such a fit silently degraded into "one averaged expert").
 Disable: `--skip-fit-guard`. A quick check on your machine:
 `python3 test_field_fit_guard.py`.
+
+### Guard rework (update 2026-09-04.1) - "the guard is too aggressive"
+
+Three changes, validated on a toy bench (`scripts/bench_toy_router_guard.py`,
+reproduced the premature aborts and the rescues):
+
+1. **Divergence-bail warmup** `--fit-guard-warmup` (default `-1` = auto,
+   `max(30, steps//10)`): the mid-fit 2x bail ("loss diverged ... stopping
+   this block early") is armed only AFTER this many steps. Before: the bail
+   fired on Adam's normal early overshoot at step ~1-12, cut the fit before
+   the optimizer had time to adapt and shipped a near-centroid block.
+   `0` = the old always-armed behavior.
+2. **Soft end-guard** (default): a fit that ends within (0.98..1.0]x of the
+   centroid baseline now WARNS and ships the best state (no gain, no harm,
+   the run continues). The old hard abort is opt-in again:
+   `--strict-fit-guard`. A fit that ended WORSE than the baseline still
+   aborts in both modes. The baseline and the post-restore re-eval are now
+   both 8-batch averages (single-batch numbers jitter ~10% and produced
+   false alarms).
+3. **Linear lr warmup** `--fit-lr-warmup N` (default 0 = off): the lr ramps
+   0 -> fit_lr over the first N steps, giving Adam its adaptation window.
+   On the toy bench this turned an aborting fit into a real one
+   (-3.9%..-11.7% vs the baseline). Recommended when blocks stall or blow up
+   at the start: `--fit-lr-warmup 30..50`.
+
+## The original router joins the rebuild (`--fit-router`)
+
+Your idea from 2026-09-04: while rebuilding the experts, tune the ORIGINAL
+router too ("за компанию"), to shrink the post-conversion gaps. Implemented
+IN PLACE on the calibration pairs (the model is not in RAM, the tuned router
+is a same-shape replacement of the gate weight - zero artifact memory cost):
+
+- `--fit-router after`  - short anchored polish once the field fit is done
+  (`--router-steps 80`, `--router-lr` = fit lr, `--router-anchor 0.03`).
+- `--fit-router joint`  - the router trains alongside the field from step 0
+  (z recomputed every step; costs a few % of step time).
+- The tuned gate weight lands in the fit files (`gw_tuned`) and REPLACES the
+  backbone gate weight in the artifact; `field_meta.json` records
+  `router_polish.n_layers_tuned`, stats in `fit_dir/router_meta.json`.
+
+**Honest expectations (toy bench, 2026-09-04):** after a CONVERGED field fit
+the router is usually NOT the bottleneck. The z-dependent rank correction
+carries a small share of the output energy, so gw gradients are tiny: even a
+30% top-k set change moved the block mse by ~0, and the result was flat on a
+confident ("skewed") router too. The polish is SAFE (anchored, best-state
+tracked, falls back to the original gw) but treat it as a cheap diagnostic;
+`--refine-rounds` (input-shift self-distillation) remains the stronger lever
+for the post-conversion gaps.
+
+`router_ft.py` was reworked for memory at the same time: the artifact loads
+in bf16 (was fp32 = 2x RAM), ONLY fp32 gate-master copies train
+(`torch.func.functional_call` keeps the router math bit-identical on any
+architecture), the rest of the model is properly frozen (before: every
+backbone parameter still had requires_grad=True and the backward graph
+materialized grads for the whole model). Net: ~2.8x less RAM on the tuning
+pass. `--inplace` rewrites the gate weights inside the artifact itself
+(default stays: a separate `<artifact>_rft` copy).
+
+## The "original activator hinders" hypothesis - checked, not confirmed
+
+Tested on the toy bench at r=16 (same fit budget for all variants, held-out
+mse on fresh inputs): a learnable per-dim scale before SiLU (`silu(g*gamma)`)
+and a scalar temperature gave NO improvement over the plain SiLU field;
+replacing SiLU with GELU made things clearly WORSE (+48% mse) - the field's
+act_fn must MATCH the base model's activation, it is load-bearing, not a
+hindrance. A rank-split probe (gu-side-only vs dn-side-only corrections vs
+both) showed both halves contribute and together they are best. Conclusion:
+the residual error lives in the rank budget and the deploy-time input shift
+(use `--refine-rounds`), not in the activation's properties.
+
+---
+
+## UPDATE-10: speed rebuild + the three holes (`--fit-init svd`, `--fit-autocast auto`, `--fit-method muon-cosine`)
+
+Three problems reported on 2026-09-04 turned out to be real, and the fix for
+the first one is also the biggest speed win to date.
+
+**Hole 1 - the init was throwing the experts' structure away.** U, V started
+as white noise (`randn*0.02`) and C as zeros, while the REAL expert deltas
+`dW_e = W_e - centroid` sit on disk. One caveat: the SVD of the MEAN delta is
+the SVD of zero (`sum_e dW_e = 0` identically) - the meaningful variant is
+the shared-basis SVD of the STACKED deltas. The pipeline now computes it in
+one streaming pass pair (`expert_basis_init`: randomized range finder + a
+small core SVD, one expert in RAM at a time), saves it per rank as
+`init_svd_blk*.pt`, and the fit starts from that basis. Toy bench (d=512,
+r=32, 70% shared delta structure): the subspace pair carries ~100% of the
+delta energy, the diagonal coordinates capture 49-68% at step 0, and after
+the SAME 120-step budget the SVD-init fit reaches held-out mse 0.00198 vs
+0.00548 for the random init - same quality in roughly 3x fewer steps.
+
+**Hole 2 - C must never go through Newton-Schulz.** `--fit-method muon` /
+`muon-cosine` split BY NAME: only the U*/V* operator factors are Muon
+candidates; Cgu/Cdn (independent per-expert coordinates - NS would couple
+unrelated experts and equalize their singular values) and the router stay on
+Adam. The toy bench confirmed C-in-muon brings no gain (0.002312 vs 0.002319
+held-out), so excluding it is free. `--muon-max-dim` (default 512) gates U/V
+by min(shape): on real models the big centroid matrices stay on Adam; on
+small geometries they join Muon automatically - the toy's best arm
+(0.001706, ~14% better than adam-cosine), but on real models NS on the big
+matrices costs ~40-50% extra step time, hence the cap.
+
+**Hole 3 - jitter routing follows the clean anchor now.** The targets were
+produced by the base model on the CLEAN rows; routing on the NOISY input
+paired targets with whatever experts survived the noise (top-k flips =
+irreducible mse floor). The fit and the guard now both take z of the clean
+row (`z_all[ix]`), which is also one `_z` recompute per step cheaper.
+
+**Speed: honest autocast probe.** `--fit-autocast auto` (default) runs 8
+REAL fit steps per block geometry (1 warmup + 3 timed per dtype arm, min,
+private RNG 0xC0FFEE, params restored bit-exact after) and keeps bf16
+autocast only when it wins >=1.2x - on machines without a bf16 ISA it
+quietly stays fp32. Parameters remain fp32 either way (exact gradients);
+only the forward matmuls run in bf16 via oneDNN. Toy box: 1.7-1.8x per step.
+The decision is cached per geometry, so identical blocks do not re-probe.
+
+After updating from an older package run once:
+`python3 hf_pipeline.py <your usual args> --refresh-init`
+(it rebuilds the per-rank SVD init files for the existing pool cache and
+exits; the next fit picks them up - old fits are invalidated automatically
+via the fit signature). `--fit-init random` restores the old behavior.

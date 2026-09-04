@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# version: 2026-09-05.1 - LOW-RAM FIX: convert_tensor fills a preallocated fp32
+#   output slab-by-slab along the slowest GGUF axis (peak = the output + ~4 MB
+#   slab instead of the output + 2-3 full-size intermediates, which OOM'd on
+#   4-8 GB boxes with io-cache ram); GgufHfSource.drop_ram_cache() for OOM
+#   recovery. Output is bit-identical to the old single-shot path.
 """GGUF (incl. Q4_K_M) -> a plain HF checkpoint OLMoE (safetensors fp16/bf16).
 
 Why: transformers can load GGUF directly only for a few architectures
@@ -267,7 +272,15 @@ def gguf_to_hf_name(name, g):
     return m.get(rest, (None, None))
 
 
-def convert_tensor(rt, g, out_dtype, workers=1):
+def _slab_jobs(n_slow, step, budget):
+    """[(a, b), ...] ranges over the slowest axis; each job covers ~budget
+    elements (b - a) * step, so per-job scratch stays small regardless of the
+    tensor size."""
+    grp = max(1, int(budget) // max(1, int(step)))
+    return [(a, min(a + grp, n_slow)) for a in range(0, n_slow, grp)]
+
+
+def convert_tensor(rt, g, out_dtype, workers=1, slab_elems=1_000_000):
     """ReaderTensor -> fp32 numpy/HF layout.
 
     In gguf-py rt.shape holds GGUF ne [ne0, ne1, ...] (ne0 fastest), while
@@ -275,39 +288,81 @@ def convert_tensor(rt, g, out_dtype, workers=1):
     already (out, in) = HF layout. After dequantizing block types we reshape
     to reversed(rt.shape) when needed.
 
-    workers > 1: for expert tensors the SLOWEST ne axis (the expert index) is
-    contiguous in the byte stream, so the packed data splits into per-expert
-    slabs that dequantize in a thread pool (numpy releases the GIL - real
-    parallelism). Falls back to single-thread when the split is unsafe."""
+    Memory-safe (2026-09-05.1): the fp32 output is allocated ONCE and filled
+    slab-by-slab along the SLOWEST ne axis (the expert index for stacked
+    tensors - it is contiguous in the byte stream). Peak RAM = the output +
+    one ~4 MB slab (x workers in flight) instead of the output + 2-3
+    full-size intermediates (dequantize + ascontiguousarray + astype), which
+    OOM'd on 4-8 GB boxes with io-cache ram. Bit-identical to the old
+    single-shot path: block quants never straddle a slab boundary (a slab is
+    a whole multiple of the block size).
+
+    workers > 1: slabs dequantize in a thread pool (numpy releases the GIL -
+    real parallelism); results are written into the output in order. Falls
+    back to single-thread when the split is unsafe."""
     from gguf import GGMLQuantizationType, dequantize
-    from gguf.constants import GGML_QUANT_SIZES
-    data = rt.data
+    data = np.asarray(rt.data)
     q = rt.tensor_type
-    target = tuple(int(x) for x in np.asarray(rt.shape)[::-1])   # numpy-native
+    ne = [int(x) for x in rt.shape]
+    target = tuple(ne[::-1])                                     # numpy-native
+    total = int(np.prod(target)) if target else 0
+
     if q in (GGMLQuantizationType.F32, GGMLQuantizationType.F16):
-        arr = np.ascontiguousarray(data, dtype=np.float32)
-    else:
-        ne = [int(x) for x in rt.shape]
-        n_last = ne[-1] if ne else 1
-        blk_elems = GGML_QUANT_SIZES[q][0]
-        slab_elems = int(np.prod(ne[:-1])) if len(ne) > 1 else int(ne[0])
-        can_split = (workers > 1 and n_last >= 2
-                     and data.ndim == 1 and data.shape[0] % n_last == 0
-                     and slab_elems >= block_elems > 0
-                     and slab_elems % block_elems == 0 and slab_elems > 4_000_000)
-        if can_split:
+        out = np.empty(target, dtype=np.float32)
+        if total:
+            src = data.reshape(target)      # view when the layout allows it
+            if len(target) > 1 and total > slab_elems:
+                row = int(np.prod(target[1:]))
+                jobs = _slab_jobs(target[0], row, slab_elems)
+                flat = out.reshape(-1)
+                if workers > 1 and len(jobs) > 1:
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=min(workers, len(jobs))) as ex:
+                        for (a, b), part in zip(
+                                jobs, ex.map(lambda ab: src[ab[0]:ab[1]], jobs)):
+                            flat[a * row:b * row] = part.reshape(-1)
+                else:
+                    for a, b in jobs:
+                        flat[a * row:b * row] = src[a:b].reshape(-1)
+            else:
+                out.reshape(-1)[:] = src.reshape(-1)     # casts fp16 -> fp32
+        return out
+
+    # block-quantized
+    from gguf.constants import GGML_QUANT_SIZES
+    blk_elems = GGML_QUANT_SIZES[q][0]
+    n_last = ne[-1] if ne else 1            # slowest axis = expert index
+    slab = int(np.prod(ne[:-1])) if len(ne) > 1 else 0   # elems per slab
+    data = data.ravel()                     # packed 1D view (no copy)
+    out = np.empty(target, dtype=np.float32)
+    if (n_last >= 2 and slab >= blk_elems > 0 and slab % blk_elems == 0
+            and data.shape[0] % n_last == 0):
+        nbytes = data.shape[0] // n_last    # packed bytes per slab
+        jobs = _slab_jobs(n_last, slab, slab_elems)
+        flat = out.reshape(-1)
+        if len(jobs) == 1:                  # small tensor - one shot, no copies
+            flat[:] = np.asarray(dequantize(data, q),
+                                 dtype=np.float32).reshape(-1)
+        elif workers > 1 and len(jobs) > 1:
             import concurrent.futures
-            nbytes = data.shape[0] // n_last
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                parts = list(ex.map(
-                    lambda i: dequantize(data[i * nbytes:(i + 1) * nbytes], q),
-                    range(n_last)))
-            arr = np.concatenate(parts).astype(np.float32).reshape(target)
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(workers, len(jobs))) as ex:
+                for (a, b), part in zip(jobs, ex.map(
+                        lambda ab: dequantize(
+                            data[ab[0] * nbytes:ab[1] * nbytes], q), jobs)):
+                    flat[a * slab:b * slab] = np.asarray(
+                        part, dtype=np.float32).reshape(-1)
         else:
-            arr = np.ascontiguousarray(dequantize(data, q)).astype(np.float32)
-            if arr.shape != target:
-                arr = arr.reshape(target)
-    return arr
+            for a, b in jobs:
+                part = dequantize(data[a * nbytes:b * nbytes], q)
+                flat[a * slab:b * slab] = np.asarray(
+                    part, dtype=np.float32).reshape(-1)
+        return out
+    # odd layout (1D quantized etc.) - the old single-shot fallback
+    out.reshape(-1)[:] = np.asarray(dequantize(data, q),
+                                    dtype=np.float32).reshape(-1)[:total]
+    return out
 
 
 def fit_layout(arr, expected):
@@ -720,6 +775,16 @@ class GgufHfSource:
         RAM cache (shared by every GgufHfSource in this process)."""
         n, b = raw_cache_stats()
         return n, b / 1e9, _RAW_CACHE_HITS[0]
+
+    def drop_ram_cache(self):
+        """OOM recovery (2026-09-05.1): forget every packed raw-tensor copy
+        (io-cache ram) and stop caching new ones. The ram cache is a pure
+        optimization - after this, reads go back to the mmap/disk path. Used
+        by hf_stream when an allocation fails mid-run: dropping ~2-3 GB of
+        packed copies turns a hard MemoryError into a slower but working
+        continue-from-disk run."""
+        self.cache_ram = False
+        raw_cache_clear()
 
 
 def has_full_weights(d):

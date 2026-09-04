@@ -1,3 +1,12 @@
+# version: 2026-09-04.1 - MEMORY rework: the artifact loads in bf16 (was
+#   fp32: 2x RAM) and the whole model is frozen except fp32 MASTER copies of
+#   the gate weights (GateMaster via torch.func.functional_call - the router
+#   math stays bit-identical on any architecture, gradients reach the master
+#   through the bf16 cast). Old code also left every backbone param with
+#   requires_grad=True -> the backward graph materialized grads for the
+#   WHOLE model. Net RAM: ~2.8x less on the tuning pass. Added --inplace
+#   (update the artifact's gate weights in place; the default still writes a
+#   separate <artifact>_rft dir).
 #!/usr/bin/env python3
 """Post-hoc router (gate) calibration for field-compressed MoE artifacts.
 
@@ -8,15 +17,28 @@ model (everything else frozen) to minimize KL(base || field) on calibration
 text -- a cheap, surgical "re-align the router" pass.
 
 What it does:
-  1. loads the artifact (fp32 for clean gradients) and the base model (bf16,
-     no grad);
+  1. loads the artifact in bf16 with fp32 MASTER gate weights (trainable;
+     the router math runs through the original gate class unchanged) and the
+     base model (bf16, no grad);
   2. measures CE/KL before tuning on held-out windows;
-  3. takes `--steps` gentle Adam steps on gate weights only, loss =
+  3. takes `--steps` gentle Adam steps on the gate masters only, loss =
      KL(base||field) + `--anchor` * mean ||W-W0||^2/||W0||^2 (stays close to
      the original router);
   4. measures CE/KL after; aborts the save if quality got worse;
-  5. writes a NEW artifact dir (<artifact>_rft by default) with updated gate
-     weights -- the original artifact is never touched.
+  5. writes the tuned gate weights into a NEW artifact dir (<artifact>_rft
+     by default) or into the artifact itself (--inplace).
+
+Expectation setting (toy bench, 2026-09-04): at the BLOCK level the router
+is usually NOT the post-fit bottleneck - the field's z-dependent correction
+carries a small share of the output energy, so even a 30% top-k set change
+moved the block mse by ~0. This script works at the LM level (hidden-state
+drift across layers), where the effect can be larger - but treat it as a
+final polish, not a quality lever; --refine-rounds in hf_pipeline.py is the
+stronger tool for the post-conversion gaps.
+
+Memory: the artifact loads in bf16 (fp32 was 2x) and ONLY the gate masters
+(n_exp x d fp32 per layer, ~0.5 MB each) train; the base stays bf16. On
+OLMoE-1B-7B that is ~14 GB (artifact) + ~14 GB (base) instead of ~28 + 14.
 
 Usage:
   python3 router_ft.py --artifact results/field_xxx_r128 --base base.gguf
@@ -32,6 +54,7 @@ import sys
 import hf_env  # noqa: F401  -- HF cache inside the project; BEFORE transformers
 
 import torch  # noqa: E402
+import torch.nn as nn  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +62,28 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 
 def eprint(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+class GateMaster(nn.Module):
+    """fp32 MASTER copy of a gate weight inside a bf16 model.
+
+    forward re-runs the ORIGINAL gate module with the bf16 cast of the
+    master via torch.func.functional_call: the router math stays exactly
+    the original's (any architecture / contract), and gradients flow back
+    into the fp32 master through the cast."""
+
+    def __init__(self, orig_gate):
+        super().__init__()
+        self.orig = orig_gate
+        for q in self.orig.parameters():
+            q.requires_grad_(False)
+        w = self.orig.weight
+        self.out_dtype = w.dtype
+        self.register_parameter("w", nn.Parameter(w.detach().float().clone()))
+
+    def forward(self, x):
+        w_cast = self.w.to(self.out_dtype)
+        return torch.func.functional_call(self.orig, {"weight": w_cast}, (x,))
 
 
 def load_base(path, dtype, device):
@@ -60,22 +105,38 @@ def load_base(path, dtype, device):
 
 
 def load_artifact_train(path, device):
-    """Artifact in fp32 (gradients), trust_remote_code."""
+    """Artifact in bf16 (memory!), gate weights replaced by fp32 masters,
+    everything except the masters frozen. trust_remote_code."""
     from transformers import AutoModelForCausalLM
     with open(os.path.join(path, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
     if (cfg.get("quantization_config") or {}).get("quant_method"):
         sys.exit("Q4-quantized artifact is not supported here; "
                  "rebuild with --save-backbone bf16")
-    m = AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32,
+    m = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16,
                                              trust_remote_code=True,
                                              low_cpu_mem_usage=True)
-    return m.to(device).train()
+    m.to(device).train()
+    # freeze EVERYTHING: the old fp32 path left the whole backbone with
+    # requires_grad=True, so backward built a grad buffer per parameter
+    # (RAM + time for nothing)
+    for q in m.parameters():
+        q.requires_grad_(False)
+    n_gates = 0
+    for name, mod in list(m.named_modules()):
+        if hasattr(mod, "gate") and hasattr(mod, "Cgu"):
+            mod.gate = GateMaster(mod.gate)
+            n_gates += 1
+    if not n_gates:
+        sys.exit("no field blocks found")
+    eprint(f"artifact bf16 + {n_gates} fp32 gate masters (trainable)")
+    return m
 
 
 def field_blocks(model):
     return [(n, m) for n, m in model.named_modules()
-            if hasattr(m, "gate") and hasattr(m, "Cgu")]
+            if hasattr(m, "gate") and hasattr(m, "Cgu")
+            and isinstance(m.gate, GateMaster)]
 
 
 def windows(ids_all, ctx, n, seed, device):
@@ -102,37 +163,57 @@ def eval_ce_kl(art, bmodel, wins):
     return sum(ces) / len(ces), sum(kls) / len(kls)
 
 
-def save_gates(artifact_dir, out_dir, blocks, model):
-    """Copy artifact -> out_dir, rewrite gate weights in the safetensors."""
-    if os.path.exists(out_dir):
-        sys.exit(f"refusing to overwrite existing dir: {out_dir}")
-    eprint(f"copying artifact -> {out_dir}")
-    shutil.copytree(artifact_dir, out_dir)
+def write_gates_into_dir(out_dir, gate_new):
+    """Rewrite the gate tensors inside an EXISTING artifact dir (safetensors
+    only, shard-by-shard through a .tmp file + atomic replace)."""
     index_path = os.path.join(out_dir, "model.safetensors.index.json")
     if os.path.isfile(index_path):
         with open(index_path, encoding="utf-8") as f:
             wmap = json.load(f)["weight_map"]
+        shards = sorted(set(wmap.values()))
     else:
-        wmap = {}
-    # map: gate param -> trained tensor (cpu, original dtype)
-    gate_new = {}
-    for (name, _), p in zip(blocks, model.gate_params):
-        key = f"{name}.gate.weight"
-        gate_new[key] = p.detach().to(model.gate_dtype[key]).cpu()
-    shards = sorted(set(list(wmap.values()) or
-                        [f for f in os.listdir(out_dir) if f.endswith(".safetensors")]))
+        shards = sorted(f for f in os.listdir(out_dir)
+                        if f.endswith(".safetensors"))
     from safetensors.torch import load_file, save_file
+    done, written_keys = 0, set()
     for shard in shards:
         sp = os.path.join(out_dir, shard)
         sd = load_file(sp)
         touched = [k for k in sd if k in gate_new]
+        if not touched:
+            continue
         for k in touched:
-            sd[k] = gate_new.pop(k)
-        if touched:
-            save_file(sd, sp, metadata={"format": "pt"})
-            eprint(f"  {shard}: updated {len(touched)} gate tensor(s)")
-    if gate_new:
-        sys.exit(f"gate keys not found in shards: {list(gate_new)[:3]}")
+            sd[k] = gate_new[k]
+            written_keys.add(k)
+        tmp = sp + ".rft_tmp"
+        save_file(sd, tmp, metadata={"format": "pt"})
+        os.replace(tmp, sp)
+        done += len(touched)
+        eprint(f"  {shard}: updated {len(touched)} gate tensor(s)")
+    if done < len(gate_new):
+        missing = sorted(set(gate_new) - written_keys)
+        eprint(f"warning: only {done}/{len(gate_new)} gate tensors rewritten; "
+               f"missing keys like {missing[:2]}")
+    return done
+
+
+def save_gates(artifact_dir, out_dir, blocks, model, inplace=False):
+    """Write the tuned gate weights either into a copied dir (default) or
+    into the artifact itself (--inplace)."""
+    gate_new = {}
+    for (name, m), p in zip(blocks, model.gate_params):
+        key = f"{name}.gate.weight"
+        gate_new[key] = p.detach().to(m.gate.out_dtype).cpu()
+    if inplace:
+        eprint(f"updating gate weights IN PLACE in {artifact_dir}")
+        write_gates_into_dir(artifact_dir, gate_new)
+        out_dir = artifact_dir
+    else:
+        if os.path.exists(out_dir):
+            sys.exit(f"refusing to overwrite existing dir: {out_dir}")
+        eprint(f"copying artifact -> {out_dir}")
+        shutil.copytree(artifact_dir, out_dir)
+        write_gates_into_dir(out_dir, gate_new)
     # note in field_meta.json
     mp = os.path.join(out_dir, "field_meta.json")
     if os.path.isfile(mp):
@@ -156,6 +237,11 @@ def main():
                     help="weight of ||W-W0||^2 penalty (0 = free router)")
     ap.add_argument("--ctx", type=int, default=256)
     ap.add_argument("--eval-windows", type=int, default=6)
+    ap.add_argument("--inplace", action="store_true",
+                    help="rewrite the gate weights inside the artifact itself "
+                         "instead of copying it to <artifact>_rft (saves disk; "
+                         "the original gate weights are NOT backed up - keep "
+                         "the pipeline cache if you may want to revert)")
     ap.add_argument("--dry-run", action="store_true",
                     help="measure before/after potential without saving: "
                          "runs --steps steps in RAM and discards them")
@@ -176,7 +262,7 @@ def main():
         open(text, encoding="utf-8", errors="ignore").read())["input_ids"])
     eprint(f"tokens: {len(ids_all)} | device {dev}")
 
-    eprint("loading artifact (fp32, trainable gates)...")
+    eprint("loading artifact (bf16, fp32 gate masters)...")
     art = load_artifact_train(a.artifact, dev)
     blocks = field_blocks(art)
     L = len(blocks)
@@ -185,16 +271,12 @@ def main():
     eprint("loading base (targets, no grad)...")
     bmodel = load_base(a.base, torch.bfloat16, dev)
 
-    # gate weights -> trainable
+    # gate masters -> trainable
     params, W0 = [], []
-    for _, b in blocks:
-        w = b.gate.weight
-        w.requires_grad_(True)
-        params.append(w)
-        W0.append(w.detach().float().clone())
+    for _, m in blocks:
+        params.append(m.gate.w)
+        W0.append(m.gate.w.detach().float().clone())
     art.gate_params = params
-    art.gate_dtype = {f"{n}.gate.weight": b.gate.weight.dtype
-                      for (n, b) in blocks}   # dtype in the SAVED artifact
     opt = torch.optim.Adam(params, lr=a.lr)
 
     train_wins = windows(ids_all, a.ctx, a.steps, seed=31, device=dev)
@@ -235,8 +317,10 @@ def main():
           f"(dKL {(kl1 - kl0) * 100:+.2f}%, dCE {(ce1 - ce0) * 100:+.2f}%)")
 
     ft_info = dict(steps=a.steps, lr=a.lr, anchor=a.anchor, ctx=a.ctx,
+                   mode="bf16+fp32-masters",
                    ce_before=ce0, ce_after=ce1, kl_before=kl0, kl_after=kl1,
-                   gate_drift=drift, date=__import__("time").strftime("%Y-%m-%d %H:%M"))
+                   gate_drift=drift,
+                   date=__import__("time").strftime("%Y-%m-%d %H:%M"))
     art.ft_info = ft_info
 
     if a.dry_run:
@@ -246,8 +330,9 @@ def main():
         print("quality did not improve -> NOT saving. "
               "Try more --steps, other --lr, or lower --anchor.")
         return
-    out = a.out or a.artifact.rstrip("/") + "_rft"
-    save_gates(a.artifact, out, blocks, art)
+    out = a.out or (a.artifact.rstrip("/") if a.inplace
+                    else a.artifact.rstrip("/") + "_rft")
+    save_gates(a.artifact, out, blocks, art, inplace=a.inplace)
     print(f"\nsaved -> {out}\nchat: python3 hf_chat.py --model {os.path.basename(out)}")
 
 

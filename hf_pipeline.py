@@ -1,23 +1,44 @@
+# version: 2026-09-05.2 - SWAP-STORM GUARD (refine freeze fix): the capture
+#   pass of the refine round kept per-block pair chunks of up to 8192 pairs in
+#   RAM for ALL blocks at once (~1.1 GB) while the io-cache ram copy was also
+#   growing - on a 3.2 GB-free box Windows slid into a swap-storm at ~block 13
+#   (no MemoryError, the run just froze). Now: the flush threshold adapts to
+#   free RAM (1024 pairs below 8 GB -> resident ~= one batch, ~0.4 GB), the
+#   capture pass prints a per-window progress line ("frozen" vs "working" is
+#   visible), and BlockStreamRunner re-checks io-cache ram at every stage
+#   (see hf_stream).
+# version: 2026-09-05.1 - LOW-RAM FIX: (1) a cached pair pool SMALLER than the
+#   requested --per-layer-cap is now KEPT by default (>= usable floor of
+#   max(4096, 16*rank, cap/2) pairs/block) instead of forcing the most
+#   expensive re-collection, which OOM-crashed low-RAM boxes and looked like
+#   "nothing was saved" - --pool-recalibrate forces the old behavior;
+#   (2) the "cached pool holds ..." notice prints once per run, not 3-6x.
+# version: 2026-09-04.3 - RESUME FIX: the run cache no longer resets to zero
+#   after an interruption ("nothing was saved"): (1) art_meta.json is written
+#   at the START of stage 4 (it was written last, so a kill during the silent
+#   centroids+SVD loop invalidated the whole pair pool on restart); (2) the
+#   stage-4 init loop is resumable per block (existing init_blk*.pt are
+#   reused, only the missing ones are rebuilt) and prints per-block progress
+#   + timing; (3) the stage-5 fit is resumable per block (fit_blk*.pt +
+#   fit_partial.json with the exact fit_sig; only unfitted blocks re-run;
+#   finished blocks are reused verbatim); (4) all cache jsons and pair/fit
+#   saves are atomic (tmp + os.replace) - a kill mid-save cannot leave a torn
+#   file that poisons the next run. Semantics of the stage-4 skip: the pair
+#   pool is reused whenever it is on disk (the expensive, model-forward part);
+#   only missing centroids/init files are rebuilt from the model.
+# version: 2026-09-04.2 - UPDATE-10 speed rebuild + the user's three holes:
+#   --fit-init {svd,random}: SVD init of U,V,C from the STACKED expert deltas
+#   (shared-basis randomized SVD over the streamed experts, saved per-rank as
+#   fit_dir/init_svd_blk*.pt; --refresh-init rebuilds those for an existing
+#   pool without recalibrating); --fit-autocast {auto,on,off} with the honest
+#   real-step probe (1 warmup + 3 timed steps per dtype arm, >=1.2x rule);
+#   --fit-method muon|muon-cosine (BY-NAME split: U*/V* only, C*/gw never),
+#   --muon-max-dim/--muon-ns-steps; jitter routing follows the clean anchor
+#   row inside fit_field_module. Toy bench: svd-init same quality in ~3x
+#   fewer steps, autocast 1.7-1.8x/step.
+#   --fit-guard-warmup (-1=auto) and --strict-fit-guard (old hard error),
+#   --fit-lr-warmup (linear Adam adaptation ramp)
 #!/usr/bin/env python3
-# version: 2026-09-02.4 - fix "8.2 got SLOWER than 8.1": the auto decision
-#   now times ~8 REAL fit steps (fp32 vs bf16) instead of one big matmul,
-#   and keeps bf16 only if the full step is >=1.2x faster; the fit cache
-#   signature is UNCHANGED (the --fit-autocast string), so 8.2 fit
-#   artifacts stay valid. Also fixes the 8.2 UnboundLocalError that made
-#   any adam-family fit crash (ac was muon-branch-only). 2026-09-02.3:
-#   fit STEP SPEED: the fit forward runs under bf16
-#   autocast where the machine actually benefits (--fit-autocast
-#   auto|bf16|fp32; params/optimizer
-#   stay fp32, quality measured identical) + --muon-ns-steps (default 5).
-#   The step log now also prints the torch thread count at the STAGE 5
-#   banner (a 1-thread torch on a many-core box is the classic "6.86 s/step"
-#   culprit). 2026-09-02.2: fit resilience (lr/2 retry, biggest-moves
-#   diagnostics, --fit-log-every). 2026-09-02.1: Muon is the MANDATORY
-#   default fit optimizer (--fit-method muon; adam family kept for A/B
-#   rollbacks; big params fall back to Adam on CPU via --muon-max-dim) +
-#   --replace-router (FieldNoRouter: smooth coordinate map g(x) instead of
-#   the discrete router; opt-in, EXPERIMENTAL) + --norouter-hidden.
-#   Base: expert-press-update (7).zip (sha256 8a471b7d...).
 """Pipeline for a REAL MoE model from HuggingFace -> "field engine".
 
 The model is downloaded ALREADY QUANTIZED - by default the ready Q4_K_M GGUF
@@ -68,13 +89,7 @@ Local run:
 
 Fit tuning:
   --fit-preset fast|balanced|quality           # steps/batch/lr/method bundles
-  --fit-method muon|muon-cosine|adam|adamw|adam-cosine|rmsprop
-                                               # Muon is the MANDATORY default;
-                                               # adam family = A/B rollbacks
-  --muon-max-dim 512                           # min(shape) cap for Newton-Schulz
-                                               # (bigger params -> paired Adam;
-                                               # raise on GPU to cover all)
-  --replace-router                             # EXPERIMENTAL FieldNoRouter mode
+  --fit-method adam|adamw|adam-cosine|rmsprop  # optimizer type
   --fit-workers 2                              # parallel fit of independent blocks
   --prefetch 0                                 # disable background block prefetch
                                                # (saves ~1 block of RAM)
@@ -123,48 +138,13 @@ CORPUS_URLS = (
 REQUIRED = [("transformers", "transformers>=5"), ("huggingface_hub", "huggingface_hub"),
             ("safetensors", "safetensors"), ("accelerate", "accelerate")]
 # fit presets: bundles of steps/batch/lr/method (explicit flags always win)
-# Muon is the MANDATORY default since 2026-09-02.1 (user measurements: same
-# quality in ~half the Adam steps on the matrix field params; lr peak
-# ~0.003-0.005). Rollback for A/B: --fit-method adam-cosine (the old default).
 FIT_PRESETS = {
-    "fast":     dict(fit_steps=120, fit_bs=4096, fit_lr=4e-3, fit_method="muon"),
-    "balanced": dict(fit_steps=300, fit_bs=4096, fit_lr=4e-3, fit_method="muon"),
-    "quality":  dict(fit_steps=600, fit_bs=8192, fit_lr=3e-3, fit_method="muon"),
+    "fast":     dict(fit_steps=120, fit_bs=4096, fit_lr=3e-3, fit_method="adam-cosine"),
+    "balanced": dict(fit_steps=300, fit_bs=4096, fit_lr=2e-3, fit_method="adam-cosine"),
+    "quality":  dict(fit_steps=600, fit_bs=8192, fit_lr=2e-3, fit_method="adam-cosine"),
 }
-FIT_LEGACY = dict(fit_steps=300, fit_bs=4096, fit_lr=4e-3, fit_method="muon")
+FIT_LEGACY = dict(fit_steps=300, fit_bs=4096, fit_lr=2e-3, fit_method="adam")
 T = {}
-
-
-def fit_block_with_retry(fft, make_mod, X, Y, lr, steps, bs, device,
-                         log_prefix, guard, method, seed, jitter, early_stop,
-                         muon_max_dim, log_every, autocast="auto",
-                         muon_ns_steps=5):
-    """Fit one block; on a FIT GUARD trip ("mse did not drop" - the classic
-    signature of a diverged / random-walking fit) retry ONCE at lr/2 with a
-    fresh module. A diverged block ships at ~baseline and would otherwise
-    kill the whole run at the guard; halving the lr tames the walk, while
-    healthy blocks are untouched (the retry only fires on a guard failure).
-    fft: fit_field_module (passed in - it is imported inside main()).
-    make_mod: () -> a freshly built fit module (the first attempt leaves the
-    module state dirty, the retry must start from the pristine init)."""
-    try:
-        mod = make_mod()
-        return mod, fft(mod, X, Y, steps, bs, lr, device,
-                        log_prefix=log_prefix, guard=guard, method=method,
-                        seed=seed, jitter=jitter, early_stop=early_stop,
-                        muon_max_dim=muon_max_dim, log_every=log_every,
-                        autocast=autocast, muon_ns_steps=muon_ns_steps)
-    except RuntimeError as e:
-        if "FIT GUARD: mse did not drop" not in str(e):
-            raise
-    print(f"    {log_prefix} FIT GUARD tripped - retrying once at lr/2 "
-          f"({lr:.2e} -> {lr / 2:.2e})", flush=True)
-    mod = make_mod()
-    return mod, fft(mod, X, Y, steps, bs, lr / 2, device,
-                    log_prefix=log_prefix, guard=guard, method=method,
-                    seed=seed, jitter=jitter, early_stop=early_stop,
-                    muon_max_dim=muon_max_dim, log_every=log_every,
-                    autocast=autocast, muon_ns_steps=muon_ns_steps)
 
 # Pipeline stages: togglable via --stages / --skip (names in run order).
 STAGE_ORDER = ["download", "texts", "base", "calibrate", "fit", "refine",
@@ -317,16 +297,37 @@ def do_cleanup(targets):
     print(f"freed {freed:.2f} GB", flush=True)
 
 
-def cache_is_complete(cache_dir, lp_dir, min_pairs=0, pairs_only=False):
-    """Pair pool + base log-probs already on disk? -> block count (0 = no).
-    Pairs/centroids/log-probs depend on neither rank nor text order - such a
-    cache survives a --rank/--fit-* change, and --cleanup does NOT touch it.
+def _save_json_atomic(path, obj):
+    """Write a cache json atomically (tmp + os.replace). A kill mid-write
+    leaves the previous version intact instead of a torn/empty file that
+    would invalidate the whole cache on the next start."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+_POOL_NOTICE_SHOWN = [False]   # the pool-size notice prints once per run
+
+
+def pool_is_complete(cache_dir, min_pairs=0, keep_smaller=False,
+                     min_useful=0):
+    """Pair pool already on disk? -> block count (0 = no).
+    The PAIR POOL is the expensive part of stage 4 (a full model forward
+    over the calibration windows) and it does not depend on rank nor on the
+    fit settings - once it is on disk it must never be re-collected, even if
+    the later (cheap, but silent) centroids/SVD-init loop did not finish.
+    Requires art_meta.json + every pairs_blk{i}.pt (art_meta is written at
+    the START of stage 4, so a kill anywhere later keeps the pool resumable).
+
     min_pairs: when the cached pool holds FEWER pairs per block than the
-    requested --per-layer-cap, the cache is treated as incomplete (the caller
-    recalibrates with the bigger cap).
-    pairs_only: check ONLY the pair pool + centroids (art_meta/pairs/init),
-    without the base log-prob cache - enough for fit/save/refine, which never
-    read the log-probs; the full check is needed by base/verify."""
+    requested --per-layer-cap it is treated as incomplete (the caller
+    recalibrates with the bigger cap) - UNLESS keep_smaller and the pool is
+    still usable (>= min_useful). 2026-09-05.1: re-collection is the most
+    expensive thing the pipeline does and it OOM-crashed low-RAM boxes (and
+    looked like "nothing was saved"); 49k pairs at rank 128 = 384 pairs/dim
+    is already ample, so a usable smaller pool is KEPT with a one-line
+    notice and --pool-recalibrate restores the old forced re-collection."""
     import torch as _t
     am = os.path.join(cache_dir, "art_meta.json")
     if not os.path.isfile(am):
@@ -338,6 +339,66 @@ def cache_is_complete(cache_dir, lp_dir, min_pairs=0, pairs_only=False):
         return 0
     if not all(os.path.isfile(os.path.join(cache_dir, f"pairs_blk{i}.pt"))
                for i in range(n)):
+        return 0
+    if min_pairs:
+        try:
+            x0 = _t.load(os.path.join(cache_dir, "pairs_blk0.pt"),
+                         map_location="cpu")["X"]
+            have = int(x0.shape[0])
+            if have < min_pairs:
+                if keep_smaller and have >= min_useful:
+                    if not _POOL_NOTICE_SHOWN[0]:
+                        _POOL_NOTICE_SHOWN[0] = True
+                        print(f"cached pool holds {have} pairs/block < requested "
+                              f"cap {min_pairs} - keeping the cached pool "
+                              f"(>= the usable floor {min_useful}); pass "
+                              f"--pool-recalibrate to force a bigger one",
+                              flush=True)
+                    return n
+                if not _POOL_NOTICE_SHOWN[0]:
+                    _POOL_NOTICE_SHOWN[0] = True
+                    print(f"cached pool holds {have} pairs/block < requested "
+                          f"cap {min_pairs} - recalibrating with the bigger pool",
+                          flush=True)
+                return 0
+        except Exception:
+            return 0
+    return n
+
+
+def lp_cache_is_complete(cache_dir, lp_dir):
+    """eval_tokens.pt + every lp_XXX.pt chunk present/loadable? Prereq of the
+    verify stage only (the base log-prob cache is independent of the pair
+    pool / init files state)."""
+    import torch as _t
+    tp = os.path.join(cache_dir, "eval_tokens.pt")
+    if not os.path.isfile(tp):
+        return False
+    try:
+        d = _t.load(tp, map_location="cpu")
+    except Exception:  # noqa: BLE001
+        return False
+    return all(os.path.isfile(os.path.join(lp_dir, f"lp_{i:03d}.pt"))
+               for i in range(len(d["X"])))
+
+
+def cache_is_complete(cache_dir, lp_dir, min_pairs=0, pairs_only=False,
+                      keep_smaller=False, min_useful=0):
+    """Pair pool + base log-probs already on disk? -> block count (0 = no).
+    Pairs/centroids/log-probs depend on neither rank nor text order - such a
+    cache survives a --rank/--fit-* change, and --cleanup does NOT touch it.
+    min_pairs: when the cached pool holds FEWER pairs per block than the
+    requested --per-layer-cap, the cache is treated as incomplete (the caller
+    recalibrates with the bigger cap) - unless keep_smaller/min_useful say
+    the smaller pool is usable (see pool_is_complete, 2026-09-05.1).
+    pairs_only: check ONLY the pair pool + per-block init files (art_meta/
+    pairs/init_blk), without the base log-prob cache - enough for
+    fit/save/refine, which never read the log-probs; the full check is needed
+    by base/verify. The pair-pool-only check is pool_is_complete()."""
+    import torch as _t
+    n = pool_is_complete(cache_dir, min_pairs=min_pairs,
+                         keep_smaller=keep_smaller, min_useful=min_useful)
+    if not n:
         return 0
     if not all(os.path.isfile(os.path.join(cache_dir, f"init_blk{i}.pt"))
                for i in range(n)):
@@ -352,17 +413,6 @@ def cache_is_complete(cache_dir, lp_dir, min_pairs=0, pairs_only=False):
             return 0
         if not all(os.path.isfile(os.path.join(lp_dir, f"lp_{i:03d}.pt"))
                    for i in range(len(d["X"]))):
-            return 0
-    if min_pairs:
-        try:
-            x0 = _t.load(os.path.join(cache_dir, "pairs_blk0.pt"),
-                         map_location="cpu")["X"]
-            if x0.shape[0] < min_pairs:
-                print(f"cached pool holds {x0.shape[0]} pairs/block < requested "
-                      f"cap {min_pairs} - recalibrating with the bigger pool",
-                      flush=True)
-                return 0
-        except Exception:
             return 0
     return n
 
@@ -441,9 +491,17 @@ def ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, min_pairs):
     """Auto-add cheap missing stages with a notice; hard-fail with a hint when
     an expensive prerequisite is absent from disk AND from the plan. Returns
     the final ordered plan."""
-    full = cache_is_complete(pool_dir, lp_dir, min_pairs=min_pairs)
+    ks = not getattr(args, "pool_recalibrate", False)
+    mu = max(4096, 16 * args.rank, (min_pairs or 0) // 2)
+    full = cache_is_complete(pool_dir, lp_dir, min_pairs=min_pairs,
+                             keep_smaller=ks, min_useful=mu)
     pairs = full or cache_is_complete(pool_dir, lp_dir, min_pairs=min_pairs,
-                                      pairs_only=True)
+                                      pairs_only=True, keep_smaller=ks,
+                                      min_useful=mu)
+    # pool = the pair files alone (the expensive part; init files are cheap
+    # model-only passes that a resumed run rebuilds per block)
+    pool = pairs or pool_is_complete(pool_dir, min_pairs=min_pairs,
+                                     keep_smaller=ks, min_useful=mu)
     auto = []
 
     def add(s):
@@ -455,9 +513,9 @@ def ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, min_pairs):
         add("download")
     if "refine" in plan:
         add("texts")
-    if "calibrate" in plan and not pairs:
+    if "calibrate" in plan and not pool:
         add("texts")
-    if "fit" in plan and not pairs and "calibrate" not in plan:
+    if "fit" in plan and not pool and "calibrate" not in plan:
         hint = ""
         try:
             import torch as _t
@@ -470,15 +528,36 @@ def ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, min_pairs):
         sys.exit(f"stage 'fit': the pair pool is missing/incomplete in {pool_dir}\n"
                  "  -> run the full pipeline once (keep base+calibrate in the "
                  f"plan), or drop 'fit' from --stages{hint}")
+    if "fit" in plan and pool and "calibrate" not in plan:
+        # the pool is on disk, but an interruption could have left some
+        # init_blk*.pt unwritten (the fit needs ALL of them) - rebuild just
+        # the missing init files instead of dying inside the fit
+        have = pool
+        if not all(os.path.isfile(os.path.join(pool_dir, f"init_blk{i}.pt"))
+                   for i in range(have)):
+            add("calibrate")
+            add("texts")
+            print("note: init_blk*.pt are incomplete in the cache - auto-adding "
+                  "the 'calibrate' stage (the pair pool is reused, only the "
+                  "missing init files are rebuilt)", flush=True)
+    elif (("save" in plan or "refine" in plan) and pool
+            and "calibrate" not in plan and "fit" not in plan):
+        if not all(os.path.isfile(os.path.join(pool_dir, f"init_blk{i}.pt"))
+                   for i in range(pool)):
+            add("calibrate")
+            add("texts")
+            print("note: init_blk*.pt are incomplete in the cache - auto-adding "
+                  "the 'calibrate' stage (the pair pool is reused, only the "
+                  "missing init files are rebuilt)", flush=True)
     if ("save" in plan or "refine" in plan) and "fit" not in plan:
-        n = pairs or 0
+        n = pool or 0
         if not n or not fit_blocks_ok(fit_dir, n):
             what = "stage 'refine': the fits" if "refine" in plan else \
                    "stage 'save': the fits"
             sys.exit(f"{what} are missing in {fit_dir}\n"
                      "  -> keep 'fit' in the plan, or finish a full run first")
     if "verify" in plan:
-        if not full and "base" not in plan:
+        if not lp_cache_is_complete(pool_dir, lp_dir) and "base" not in plan:
             sys.exit("stage 'verify': the base log-prob cache is missing/"
                      f"incomplete in {lp_dir}\n"
                      "  -> keep 'base' in the plan (one streaming pass builds "
@@ -590,8 +669,20 @@ def check_io_cache_fit(args, gguf_path):
         args.io_cache = "disk"
     else:
         print(f"[profile] WARNING: io-cache ram may not fit ({size_gb:.1f} GB "
-              f"GGUF, {avail:.1f} GB free) - kept as explicitly requested",
-              flush=True)
+              f"GGUF, {avail:.1f} GB free) - every streaming stage re-checks "
+              f"and falls back to disk if it still does not fit "
+              f"(MOE_FORCE_IO_RAM=1 overrides)", flush=True)
+
+
+def refine_flush_at(available_gb):
+    """Resident-pair flush threshold for the refine capture pass
+    (2026-09-05.2). The old fixed 8192 pairs/block meant ~1.1 GB of chunks
+    across 23 blocks on top of the backbone and (optionally) the io-cache ram
+    copy - the last straw on a 3.2 GB-free box (it froze mid-window without
+    any error). Below 8 GB free: flush at 1024 pairs -> each block holds at
+    most the current window's batch (~0.4 GB resident for 23x4096x1024 bf16
+    x2 sides); the cost is more, smaller chunk files, nothing else."""
+    return 1024 if (available_gb is not None and available_gb < 8.0) else 8192
 
 
 def print_profile(args, fit, preset):
@@ -607,6 +698,8 @@ def print_profile(args, fit, preset):
                 + (f" preset={preset}" if preset else "")),
         ("fit_workers", args.fit_workers),
         ("fit_jitter", args.fit_jitter),
+        ("fit_init/autocast", f"{args.fit_init}/{args.fit_autocast}"),
+        ("muon", f"max_dim={args.muon_max_dim} ns={args.muon_ns_steps}"),
         ("fit_early_stop", args.fit_early_stop),
         ("refine_rounds", args.refine_rounds),
         ("io_threads", args.io_threads),
@@ -615,6 +708,8 @@ def print_profile(args, fit, preset):
         ("pairs/layer cap", args.per_layer_cap),
         ("eval chunks / kl chunks", f"{args.eval_chunks} / {args.kl_chunks}"),
     ]
+    if getattr(args, "pool_recalibrate", False):
+        rows.append(("pool", "forced recalibration (--pool-recalibrate)"))
     print("profile: " + " | ".join(f"{k}={v}" for k, v in rows), flush=True)
 
 
@@ -629,7 +724,7 @@ def _compat_check():
         "hf_stream": ("BlockStreamRunner",),
         "hf_field_transform": ("_mdev", "fit_field_module",
                                "block_router_bias", "block_shared_weights",
-                               "Muon", "MUON_NS_MAX_DIM"),
+                               "expert_basis_init", "_resolve_fit_autocast"),
         "hf_gguf_to_hf": ("resolve_gguf",),
     }
     for mod, names in need.items():
@@ -694,18 +789,51 @@ def main():
                          "under the high profile)")
     ap.add_argument("--calib-ctx", type=int, default=512)
     ap.add_argument("--per-layer-cap", type=int, default=8192)
+    ap.add_argument("--pool-recalibrate", action="store_true",
+                    help="force re-collection when the cached pair pool holds "
+                         "fewer pairs/block than --per-layer-cap (default: keep "
+                         "the cached pool when it is still usable - >= "
+                         "max(4096, 16*rank, cap/2) pairs/block - re-collection "
+                         "is the most expensive stage and OOM-crashes low-RAM "
+                         "boxes)")
     ap.add_argument("--fit-steps", type=int, default=None,
                     help="fit steps per block (default: 300, or the preset value)")
     ap.add_argument("--fit-bs", type=int, default=None,
                     help="fit batch size (default: 4096, or the preset value)")
     ap.add_argument("--fit-lr", type=float, default=None,
-                    help="fit learning rate (default: 4e-3 for muon, or the "
-                         "preset value)")
+                    help="fit learning rate (default: 2e-3, or the preset value)")
     ap.add_argument("--fit-method", default=None,
-                    help="optimizer: muon (MANDATORY default) | muon-cosine | "
-                         "adam | adamw | adam-cosine | rmsprop "
-                         "(default: the preset value; adam-cosine = the old "
-                         "behavior, for A/B rollbacks)")
+                    help="optimizer: adam | adamw | adam-cosine | rmsprop | "
+                         "muon | muon-cosine (muon: NS-orthogonalized updates "
+                         "for the U*/V* factors, BY-NAME split; C*/router "
+                         "always stay on Adam; default: adam, or the preset "
+                         "value)")
+    ap.add_argument("--fit-autocast", default="auto", choices=["auto", "on", "off"],
+                    help="bf16-autocast fit (params stay fp32, matmuls run "
+                         "bf16 via oneDNN - 1.7-1.8x/step on the toy): auto "
+                         "= the honest real-step probe decides per geometry "
+                         "(8 real steps total, cached; keeps fp32 when bf16 "
+                         "is not faster, e.g. no AMX/AVX512-bf16 ISA)")
+    ap.add_argument("--muon-max-dim", type=int, default=512,
+                    help="muon split gate: a U*/V* factor goes through "
+                         "Newton-Schulz only if min(shape) <= this (raise to "
+                         "let the big centroid matrices join; costs ~40-50%% "
+                         "of the step time on real models)")
+    ap.add_argument("--muon-ns-steps", type=int, default=5,
+                    help="Newton-Schulz iterations per muon update "
+                         "(3 = cheaper/looser, 5 = default)")
+    ap.add_argument("--fit-init", default="svd", choices=["svd", "random"],
+                    help="U,V,C initialization: svd = shared basis of the "
+                         "REAL expert deltas (captures ~50-70%% of the delta "
+                         "energy at step 0 - the toy reaches the old fit's "
+                         "quality in ~3x fewer steps; computed once per rank "
+                         "from the streamed experts); random = the old "
+                         "randn*0.02/zeros")
+    ap.add_argument("--refresh-init", action="store_true",
+                    help="rebuild ONLY the per-rank SVD init files "
+                         "(init_svd_blk*.pt) for an existing pool cache and "
+                         "exit - use once after updating from an older "
+                         "version, then re-run the fit")
     ap.add_argument("--fit-jitter", type=float, default=0.0,
                     help="Gaussian noise on fit inputs, per-dim std units "
                          "(variance reduction for a SMALL calibration pool: "
@@ -718,45 +846,41 @@ def main():
     ap.add_argument("--fit-workers", type=int, default=1,
                     help="parallel fit workers for independent blocks (2-4 on a "
                          "multi-core CPU; 1 = sequential)")
-    ap.add_argument("--fit-log-every", type=int, default=100,
-                    help="log the fit mse every N steps (default 100; set "
-                         "e.g. 25 to actually see movement on slow blocks)")
-    ap.add_argument("--fit-autocast", default="auto",
-                    choices=["auto", "bf16", "fp32"],
-                    help="run the fit forward under bf16 autocast (params and "
-                         "optimizer state stay fp32): 1.8-2.8x faster steps on "
-                         "AMX/AVX512-BF16 CPUs and on GPUs, quality measured "
-                         "identical; auto (default) times REAL fit steps in "
-                         "both dtypes once per geometry and keeps bf16 only "
-                         "where the full step is >=1.2x faster (a big-matmul "
-                         "probe alone can lie on CPUs without fast bf16); "
-                         "fp32 = the old behavior")
-    ap.add_argument("--muon-ns-steps", type=int, default=5,
-                    help="Newton-Schulz iterations per Muon step (default 5; "
-                         "3 saves ~40%% of the NS time at <=0.5%% quality cost "
-                         "- for slow CPUs where NS is a visible share)")
     ap.add_argument("--fit-early-stop", type=int, default=0,
                     help="stop each block's fit after 2 consecutive flat mse "
                          "checkpoints (every N steps, e.g. 50; 0 = off). Saves "
                          "time on plateauing blocks")
-    ap.add_argument("--muon-max-dim", type=int, default=None,
-                    help="min(shape) cap for Muon's Newton-Schulz update; "
-                         "bigger params (full-size centroids) fall back to a "
-                         "paired Adam (default 512 - CPU-friendly; raise on "
-                         "GPU, e.g. 4096, to cover everything)")
-    ap.add_argument("--replace-router", action="store_true",
-                    help="EXPERIMENTAL FieldNoRouter mode (opt-in): fit and "
-                         "deploy the field WITHOUT the discrete router - the "
-                         "coordinates come from a smooth direct map g(x) "
-                         "(removes the top-k boundary discontinuity; the toy "
-                         "verdict of 2026-09-02). The artifact's "
-                         "modeling_field.py gets a self-contained no-router "
-                         "runtime appended; base artifacts are unaffected")
-    ap.add_argument("--norouter-hidden", type=int, default=0,
-                    help="hidden width of the smooth coordinate map g(x) in "
-                         "--replace-router mode (0 = linear map, the toy-"
-                         "proven config; e.g. 256 = one-GELU MLP - slightly "
-                         "better in the 2026-09-02 toy R2, slower to fit)")
+    ap.add_argument("--fit-guard-warmup", type=int, default=-1,
+                    help="the 2x divergence bail is armed only after this many "
+                         "fit steps: -1 = auto (max(30, steps//10)), 0 = old "
+                         "always-armed behavior. The old guard could abort a "
+                         "block on Adam's normal early overshoot, before the "
+                         "optimizer had time to adapt")
+    ap.add_argument("--strict-fit-guard", action="store_true",
+                    help="old hard end-guard: abort the run when a block's fit "
+                         "mse did not drop at least 2%% below the centroid "
+                         "baseline. Default: warn and ship the best state (a "
+                         "fit that ended WORSE than the baseline still aborts)")
+    ap.add_argument("--fit-lr-warmup", type=int, default=0,
+                    help="linear lr ramp over the first N fit steps - gives "
+                         "Adam time to adapt (0 = off). Useful when blocks "
+                         "stall or diverge at the start")
+    ap.add_argument("--fit-router", default="off", choices=["off", "after", "joint"],
+                    help="let the ORIGINAL router join the rebuild (in place, "
+                         "pairs from disk - no extra artifact memory): after = "
+                         "short anchored polish once the field fit is done; "
+                         "joint = the router trains alongside the field from "
+                         "step 0. The tuned router replaces the gate weight in "
+                         "the artifact. Toy-bench caveat: after a converged fit "
+                         "the router is usually NOT the bottleneck - treat as a "
+                         "cheap diagnostic; --refine-rounds is the stronger lever")
+    ap.add_argument("--router-steps", type=int, default=80,
+                    help="anchored router-polish steps for --fit-router after")
+    ap.add_argument("--router-lr", type=float, default=None,
+                    help="router polish lr (default: the fit lr)")
+    ap.add_argument("--router-anchor", type=float, default=0.03,
+                    help="L2 anchor pulling the router to the original "
+                         "(0 = free router; higher = safer for LM-level drift)")
     ap.add_argument("--refine-rounds", type=int, default=0,
                     help="self-distillation rounds after the first fit (try 1-2): "
                          "a streaming pass where the FIELD model feeds its own "
@@ -847,6 +971,9 @@ def main():
     fit, fit_preset = resolve_fit_args(args)
     args.fit_steps, args.fit_bs = fit["fit_steps"], fit["fit_bs"]
     args.fit_lr, args.fit_method = fit["fit_lr"], fit["fit_method"]
+    # effective router-polish lr (always in scope: refine reuses it even when
+    # stage 5 itself was skipped as cached)
+    router_lr = args.router_lr if args.router_lr is not None else fit["fit_lr"]
     print_profile(args, fit, fit_preset)
 
     t0 = time.time()
@@ -861,13 +988,13 @@ def main():
     from hf_field_transform import (base_metrics_from_cache, block_geometry,
                                     block_router_bias, block_shared_weights,
                                     collect_pairs, eval_logits_cache_disk,
-                                    eval_vs_cache_disk, expert_means,
-                                    field_accounting, find_moe_blocks,
-                                    fit_field_module, generate_text,
-                                    load_pairs_block, make_batches,
+                                    eval_vs_cache_disk, expert_basis_init,
+                                    expert_means, field_accounting,
+                                    find_moe_blocks, fit_field_module,
+                                    generate_text, load_pairs_block,
+                                    make_batches, polish_router_module,
                                     router_weight, save_pairs_block,
-                                    write_field_artifact, MUON_NS_MAX_DIM,
-                                    FieldSparseMoe)
+                                    write_field_artifact, FieldSparseMoe)
     from hf_stream import BlockStreamRunner
     if args.threads:
         torch.set_num_threads(args.threads)
@@ -902,6 +1029,8 @@ def main():
     out_dir = args.out or os.path.join(DL, f"field_{tag}_r{args.rank}")
     T["cache_dir"], T["fit_dir"] = pool_dir, fit_dir
     mp = 0 if args.smoke else args.per_layer_cap
+    pool_ks = not getattr(args, "pool_recalibrate", False)
+    pool_mu = max(4096, 16 * args.rank, mp // 2) if mp else 0
     plan = ensure_prereqs(plan, args, pool_dir, lp_dir, fit_dir, out_dir, mp)
 
     reuse_only = "download" not in plan
@@ -1027,11 +1156,34 @@ def main():
         calib_ids, eval_ids = None, None
 
     # ========== PHASE A - base + calibration: STREAMING (model not in RAM) =====
-    full_cache = cache_is_complete(pool_dir, lp_dir, min_pairs=mp)
+    pairs = None            # (path, n) per block; built in every branch below
+    full_cache = cache_is_complete(pool_dir, lp_dir, min_pairs=mp,
+                                   keep_smaller=pool_ks, min_useful=pool_mu)
     pairs_cache = full_cache or cache_is_complete(pool_dir, lp_dir, min_pairs=mp,
-                                                  pairs_only=True)
+                                                  pairs_only=True,
+                                                  keep_smaller=pool_ks,
+                                                  min_useful=pool_mu)
+    # the pair pool alone (the expensive model-forward part); the init files
+    # are cheap model-only passes and are rebuilt per block when missing
+    pool_cache = pairs_cache or pool_is_complete(pool_dir, min_pairs=mp,
+                                                 keep_smaller=pool_ks,
+                                                 min_useful=pool_mu)
     base_pass = "base" in plan and not full_cache
-    calib_pass = "calibrate" in plan and not pairs_cache
+    calib_pass = ("calibrate" in plan
+                  and (not pool_cache
+                       or not all(os.path.isfile(os.path.join(pool_dir,
+                                                f"init_blk{i}.pt"))
+                                  for i in range(pool_cache))))
+    refresh_only = False
+    if args.refresh_init:
+        if not pairs_cache:
+            sys.exit("--refresh-init needs the calibration pool cache (run the "
+                     "pipeline once first); nothing to refresh")
+        if args.fit_init != "svd":
+            sys.exit("--refresh-init only makes sense with --fit-init svd")
+        refresh_only = True
+        base_pass = False
+        calib_pass = True     # force the streaming pass: experts come from disk
     stream = None
     base_gen = None
     if not base_pass and not calib_pass:
@@ -1126,46 +1278,150 @@ def main():
             T["base_total_mb"] = base_total_b / 1e6
 
         if calib_pass:
-            banner("STAGE 4 - calibration: pairs to disk + centroids (STREAMING, "
-                   "weights - quantized GGUF)")
+            if refresh_only:
+                banner("STAGE 4 (--refresh-init) - rebuilding the per-rank SVD "
+                       "init files from the streamed experts")
+            elif pool_cache:
+                banner("STAGE 4 - resuming calibration: the pair pool is on "
+                       "disk, rebuilding the missing init files (STREAMING)")
+            else:
+                banner("STAGE 4 - calibration: pairs to disk + centroids "
+                       "(STREAMING, weights - quantized GGUF)")
             blocks = find_moe_blocks(model)
             geoms = [block_geometry(b, cfg) for _, b in blocks]
-            print(f"MoE blocks: {len(blocks)}; first geometry: {geoms[0]}",
-                  flush=True)
-            gen = torch.Generator().manual_seed(11)
-            batches = make_batches(calib_ids, args.calib_ctx, args.calib_bsz,
-                                   args.calib_windows, device, gen)
-            pairs = collect_pairs(model, blocks, batches, args.per_layer_cap,
-                                  flush_dir=pool_dir)
-            for i, (p, n) in enumerate(pairs):
-                print(f"  block {i}: {n} pairs -> "
-                      f"{os.path.basename(p) if p else 'EMPTY!'}", flush=True)
-                if n == 0:
-                    sys.exit("no pairs for a block - increase --calib-windows / text")
+            # art_meta.json is written FIRST (it was written LAST before
+            # 2026-09-04.3: any interruption during the silent centroids+SVD
+            # loop then invalidated the whole pair pool). It carries only the
+            # block inventory, which is known right here - write it now so
+            # every resume check below can trust the cache on disk.
+            am_path = os.path.join(pool_dir, "art_meta.json")
+            if not os.path.isfile(am_path):
+                base_obj = model.model if stream else model
+                _save_json_atomic(am_path, dict(
+                    base_cls=type(base_obj).__name__,
+                    router_cls=type(blocks[0][1].gate).__name__,
+                    router_mod=type(blocks[0][1].gate).__module__,
+                    n_layers=len(blocks),
+                    block_names=[n for n, _ in blocks]))
+            if refresh_only:
+                pairs = []
+                for i in range(pairs_cache):
+                    p = os.path.join(pool_dir, f"pairs_blk{i}.pt")
+                    pairs.append((p, load_pairs_block(p)[0].shape[0]))
+            else:
+                # pre-2026-09-04.3 runs wrote art_meta.json LAST: a kill in the
+                # silent init loop left a COMPLETE pair pool without art_meta.
+                # Adopt such orphans (full consecutive set + cap verified) so
+                # the expensive collection is not redone one more time.
+                pool_n = pool_cache
+                if not pool_n:
+                    orphan = 0
+                    while os.path.isfile(os.path.join(pool_dir,
+                                                      f"pairs_blk{orphan}.pt")):
+                        orphan += 1
+                    if orphan == len(blocks) and orphan > 0:
+                        try:
+                            x0 = load_pairs_block(os.path.join(
+                                pool_dir, "pairs_blk0.pt"))[0]
+                            if (mp == 0 or int(x0.shape[0]) >= mp
+                                    or (pool_ks
+                                        and int(x0.shape[0]) >= pool_mu)):
+                                pool_n = orphan
+                                print(f"adopting {pool_n} pairs_blk*.pt files "
+                                      f"from an interrupted run (art_meta was "
+                                      f"missing) - no re-collection", flush=True)
+                        except Exception:  # noqa: BLE001
+                            pass
+                if pool_n:
+                    pairs = []
+                    for i in range(pool_n):
+                        p = os.path.join(pool_dir, f"pairs_blk{i}.pt")
+                        pairs.append((p, load_pairs_block(p)[0].shape[0]))
+                    if pool_cache:
+                        print(f"pair pool reused from cache: {len(pairs)} "
+                              f"blocks (no re-collection)", flush=True)
+                else:
+                    print(f"MoE blocks: {len(blocks)}; first geometry: {geoms[0]}",
+                          flush=True)
+                    gen = torch.Generator().manual_seed(11)
+                    batches = make_batches(calib_ids, args.calib_ctx,
+                                           args.calib_bsz, args.calib_windows,
+                                           device, gen)
+                    pairs = collect_pairs(model, blocks, batches,
+                                          args.per_layer_cap, flush_dir=pool_dir)
+                    for i, (p, n) in enumerate(pairs):
+                        print(f"  block {i}: {n} pairs -> "
+                              f"{os.path.basename(p) if p else 'EMPTY!'}",
+                              flush=True)
+                        if n == 0:
+                            sys.exit("no pairs for a block - increase "
+                                     "--calib-windows / text")
+            os.makedirs(fit_dir, exist_ok=True)
+
+            def _save_svd_init(i, block, mgu, mdn):
+                basis = expert_basis_init(block, mgu, mdn, args.rank,
+                                          log_prefix=f"block {i}/{len(blocks)}")
+                torch.save(basis, os.path.join(fit_dir, f"init_svd_blk{i}.pt"))
+                return 1
+
+            svd_done = 0
+            inits_reused = 0
+            t_stage4 = time.time()
             for i, (_, block) in enumerate(blocks):
+                ipath = os.path.join(pool_dir, f"init_blk{i}.pt")
+                if not refresh_only and os.path.isfile(ipath):
+                    # resumable stage 4: this block's init survived the last
+                    # run - inits depend only on the model, never recompute
+                    inits_reused += 1
+                    print(f"  block {i}/{len(blocks)}: init cached - skipped",
+                          flush=True)
+                    continue
+                t0 = time.time()
+                ini = (torch.load(ipath, map_location="cpu")
+                       if refresh_only else None)
+                print(f"  block {i}/{len(blocks)}: centroids + "
+                      f"{'SVD init' if args.fit_init == 'svd' else 'init'} "
+                      f"(rank {args.rank})...", flush=True)
                 if stream:
                     with stream.with_block(i):
-                        mgu, mdn = expert_means(block)
+                        if refresh_only:
+                            mgu, mdn = ini["mgu"], ini["mdn"]
+                        else:
+                            mgu, mdn = expert_means(block)
+                        if args.fit_init == "svd":
+                            svd_done += _save_svd_init(i, block, mgu, mdn)
                 else:
-                    mgu, mdn = expert_means(block)      # without an fp32 expert stack
+                    if refresh_only:
+                        mgu, mdn = ini["mgu"], ini["mdn"]
+                    else:
+                        mgu, mdn = expert_means(block)  # without an fp32 expert stack
+                    if args.fit_init == "svd":
+                        svd_done += _save_svd_init(i, block, mgu, mdn)
+                if refresh_only:
+                    continue
                 # hy_v3: selection bias + shared experts (backbone already in RAM)
                 eb = block_router_bias(block)
                 sh = block_shared_weights(block)
                 if eb is not None or sh is not None:
                     print(f"  block {i}: bias {'yes' if eb is not None else 'no'}, "
                           f"shared {'yes' if sh is not None else 'no'}", flush=True)
+                itmp = ipath + ".tmp"
                 torch.save(dict(geom=geoms[i], gw=router_weight(block.gate).clone(),
-                                mgu=mgu, mdn=mdn, eb=eb, shared=sh),
-                           os.path.join(pool_dir, f"init_blk{i}.pt"))
-            with open(os.path.join(pool_dir, "art_meta.json"), "w",
-                      encoding="utf-8") as f:
-                base_obj = model.model if stream else model
-                json.dump(dict(base_cls=type(base_obj).__name__,
-                               router_cls=type(blocks[0][1].gate).__name__,
-                               router_mod=type(blocks[0][1].gate).__module__,
-                               n_layers=len(blocks),
-                               block_names=[n for n, _ in blocks]), f,
-                          ensure_ascii=False, indent=2)
+                                mgu=mgu, mdn=mdn, eb=eb, shared=sh), itmp)
+                os.replace(itmp, ipath)
+                print(f"  block {i}/{len(blocks)}: done in "
+                      f"{time.time() - t0:.1f}s", flush=True)
+            if refresh_only:
+                print(f"refresh-init done: {svd_done}/{len(blocks)} SVD init "
+                      f"files written to {fit_dir} - now re-run the fit "
+                      "(the old fits are invalidated automatically)", flush=True)
+                if stream:
+                    stream.close()
+                release_model(model, device)
+                sys.exit(0)
+            print(f"stage 4 init files: {len(blocks) - inits_reused} rebuilt, "
+                  f"{inits_reused} reused "
+                  f"({time.time() - t_stage4:.1f}s total)", flush=True)
 
         print("unloading the backbone - the fit runs without it", flush=True)
         if stream:
@@ -1174,6 +1430,14 @@ def main():
         stream = None
     T["stream_mode"] = bool(stream)
     T["reused_cache"] = bool(pairs_cache) and not calib_pass
+    if pairs is None:
+        # the base pass re-ran (e.g. the lp cache was invalidated) while the
+        # pair pool + inits were already complete: stage 4 was skipped, so the
+        # pairs list is built from the cache here
+        pairs = []
+        for i in range(pairs_cache):
+            p = os.path.join(pool_dir, f"pairs_blk{i}.pt")
+            pairs.append((p, load_pairs_block(p)[0].shape[0]))
 
     # ================= PHASE B - field fit: model NOT in RAM ==================
 
@@ -1192,24 +1456,63 @@ def main():
     else:
         banner(f"STAGE 5 - field fit r={args.rank} on pairs from disk "
                f"({args.fit_method}, model NOT in RAM)")
-        print(f"cpu threads for the fit: {torch.get_num_threads()} "
-              f"(raise/lower via --threads; 1-thread torch on a multi-core "
-              f"box is the classic slow-step culprit)", flush=True)
         os.makedirs(fit_dir, exist_ok=True)
+        svd_files = [os.path.join(fit_dir, f"init_svd_blk{i}.pt")
+                     for i in range(n_blocks)]
+        svd_ready = (args.fit_init == "svd"
+                     and all(os.path.isfile(f) for f in svd_files))
+        if args.fit_init == "svd" and not svd_ready:
+            print("NOTE: --fit-init svd but init_svd_blk*.pt are missing for "
+                  "this rank - falling back to the random init. Rebuild them: "
+                  "python hf_pipeline.py <your usual args> --refresh-init",
+                  flush=True)
         fit_sig = dict(fit_steps=args.fit_steps, fit_bs=args.fit_bs, fit_lr=args.fit_lr,
                        fit_method=args.fit_method, fit_jitter=args.fit_jitter,
                        fit_early_stop=args.fit_early_stop,
-                       muon_max_dim=args.muon_max_dim or MUON_NS_MAX_DIM,
-                       fit_autocast=args.fit_autocast,
+                       fit_router=args.fit_router,
+                       router_steps=args.router_steps,
+                       router_lr=(args.router_lr if args.router_lr is not None
+                                  else fit["fit_lr"]),
+                       router_anchor=args.router_anchor,
+                       guard_warmup=args.fit_guard_warmup,
+                       strict_guard=args.strict_fit_guard,
+                       lr_warmup=args.fit_lr_warmup,
+                       autocast=args.fit_autocast,
+                       muon_max_dim=args.muon_max_dim,
                        muon_ns_steps=args.muon_ns_steps,
-                       replace_router=bool(args.replace_router),
-                       norouter_hidden=args.norouter_hidden,
+                       init=("svd" if svd_ready else "random"),
                        preset=fit_preset or "none")
         fit_meta_p = os.path.join(fit_dir, "fit_meta.json")
         fit_done = fit_blocks_ok(fit_dir, n_blocks) and os.path.isfile(fit_meta_p)
         if fit_done:
             with open(fit_meta_p, encoding="utf-8") as f:
                 fit_done = json.load(f) == fit_sig
+        # per-block resume: fit_partial.json carries {sig, mse{i}} for the
+        # blocks whose fit_blk{i}.pt was fully written by an interrupted run;
+        # only the missing blocks are re-fitted (a fit of hundreds of steps
+        # per block must never restart from block 0 after a kill)
+        part_mse = {}
+        if not fit_done:
+            partial_p = os.path.join(fit_dir, "fit_partial.json")
+
+            def _blk_ok(i):
+                p = os.path.join(fit_dir, f"fit_blk{i}.pt")
+                return os.path.isfile(p) and os.path.getsize(p) > 0
+
+            if os.path.isfile(partial_p):
+                try:
+                    with open(partial_p, encoding="utf-8") as f:
+                        pj = json.load(f)
+                    if pj.get("sig") == fit_sig and isinstance(pj.get("mse"), dict):
+                        part_mse = {int(k): v for k, v in pj["mse"].items()
+                                    if _blk_ok(int(k))}
+                        if part_mse:
+                            print(f"fit resume: {len(part_mse)}/{n_blocks} "
+                                  f"blocks were already fitted with the same "
+                                  f"settings - reusing their fit_blk*.pt",
+                                  flush=True)
+                except Exception:  # noqa: BLE001
+                    part_mse = {}
         if fit_done:
             print(f"fit r={args.rank} with the same settings already cached - "
                   f"skipping (new fit: delete {fit_dir} or change --fit-steps/--fit-method)",
@@ -1225,52 +1528,84 @@ def main():
                 Xi, Yi = load_pairs_block(pairs[i][0])
                 ini = torch.load(os.path.join(pool_dir, f"init_blk{i}.pt"),
                                  map_location="cpu")
-
-                def make_mod():
-                    """Fresh pristine module per attempt (a guard-failed
-                    attempt leaves the state dirty)."""
-                    fm = FieldSparseMoe(ini["geom"], args.rank, gate_w=ini["gw"],
-                                        act_fn=act, gate_bias=ini.get("eb"),
-                                        shared=ini.get("shared"),
-                                        mode="norouter" if args.replace_router else "router",
-                                        norouter_hidden=args.norouter_hidden).to(device)
-                    with torch.no_grad():
-                        fm.wgud.copy_(ini["mgu"])
-                        fm.wdnd.copy_(ini["mdn"])
-                    return fm
-
-                fit_mod, mse = fit_block_with_retry(
-                    fit_field_module, make_mod, Xi, Yi, args.fit_lr,
-                    args.fit_steps, args.fit_bs, device,
-                    log_prefix=f"block {i}/{n_blocks}",
-                    guard=not args.skip_fit_guard,
-                    method=args.fit_method, seed=5 + i,
-                    jitter=args.fit_jitter,
-                    early_stop=args.fit_early_stop,
-                    muon_max_dim=args.muon_max_dim or MUON_NS_MAX_DIM,
-                    log_every=args.fit_log_every,
-                    autocast=args.fit_autocast,
-                    muon_ns_steps=args.muon_ns_steps)
-                torch.save({n: getattr(fit_mod, n).detach().clone()
-                            for n in fit_mod.field_names},
-                           os.path.join(fit_dir, f"fit_blk{i}.pt"))
+                fit_init = dict(ini)
+                if svd_ready:                       # hole-1: real-delta SVD init
+                    fit_init.update(torch.load(svd_files[i], map_location="cpu"))
+                fit_mod = FieldSparseMoe(ini["geom"], args.rank, gate_w=ini["gw"],
+                                         act_fn=act, gate_bias=ini.get("eb"),
+                                         shared=ini.get("shared"),
+                                         init=fit_init).to(device)
+                with torch.no_grad():
+                    fit_mod.wgud.copy_(ini["mgu"])
+                    fit_mod.wdnd.copy_(ini["mdn"])
+                mse = fit_field_module(fit_mod, Xi, Yi, args.fit_steps, args.fit_bs,
+                                       args.fit_lr, device,
+                                       log_prefix=f"block {i}/{n_blocks}",
+                                       guard=not args.skip_fit_guard,
+                                       method=args.fit_method, seed=5 + i,
+                                       jitter=args.fit_jitter,
+                                       early_stop=args.fit_early_stop,
+                                       guard_warmup=(None
+                                                     if args.fit_guard_warmup < 0
+                                                     else args.fit_guard_warmup),
+                                       strict_guard=args.strict_fit_guard,
+                                       lr_warmup=args.fit_lr_warmup,
+                                       train_router=(args.fit_router == "joint"),
+                                       router_anchor=args.router_anchor,
+                                       autocast=args.fit_autocast,
+                                       muon_max_dim=args.muon_max_dim,
+                                       muon_ns_steps=args.muon_ns_steps)
+                if args.fit_router == "after":
+                    pr_stat = polish_router_module(
+                        fit_mod, Xi, Yi, args.router_steps, args.fit_bs,
+                        router_lr, device, anchor=args.router_anchor,
+                        log_prefix=f"block {i}/{n_blocks} router", seed=5 + i)
+                    router_stats[i] = pr_stat
+                elif args.fit_router == "joint":
+                    router_stats[i] = dict(drift=float(
+                        (fit_mod.gw.detach() - ini["gw"].float()).norm()
+                        / ini["gw"].float().norm().clamp_min(1e-12)))
+                out = {n: getattr(fit_mod, n).detach().clone()
+                       for n in fit_mod.field_names}
+                if args.fit_router != "off":
+                    out["gw_tuned"] = fit_mod.gw.detach().clone()
+                fpath = os.path.join(fit_dir, f"fit_blk{i}.pt")
+                ftmp = fpath + ".tmp"          # atomic: no torn fit file
+                torch.save(out, ftmp)
+                os.replace(ftmp, fpath)
+                with lk:                        # crash-safe per-block resume
+                    part_mse[i] = mse
+                    _save_json_atomic(partial_p, {"sig": fit_sig,
+                                                  "mse": {str(k): v
+                                                          for k, v
+                                                          in part_mse.items()}})
                 del fit_mod, Xi, Yi
                 gc.collect()
                 return mse
 
-            fit_mses = [None] * n_blocks
+            fit_mses = [part_mse.get(i) for i in range(n_blocks)]
+            router_stats = {}
             errors = []
-            w = max(1, min(int(args.fit_workers), n_blocks))
-            if w > 1:
+            lk = threading.Lock()
+            todo = [i for i in range(n_blocks)
+                    if part_mse.get(i) is None
+                    or not os.path.isfile(os.path.join(fit_dir,
+                                                       f"fit_blk{i}.pt"))]
+            if len(todo) < n_blocks:
+                for i in range(n_blocks):
+                    if i not in todo:
+                        print(f"  block {i}/{n_blocks}: fit cached (resume) "
+                              f"- skipped", flush=True)
+            w = max(1, min(int(args.fit_workers), len(todo) or 1))
+            if w > 1 and len(todo) > 1:
                 if not args.threads:
                     per = max(1, (os.cpu_count() or 2) // w)
                     torch.set_num_threads(per)
                     print(f"parallel fit: {w} workers x {per} cpu threads "
                           f"(--fit-workers)", flush=True)
                 work = queue.Queue()
-                for i in range(n_blocks):
+                for i in todo:
                     work.put(i)
-                lk = threading.Lock()
 
                 def run_worker():
                     while True:
@@ -1296,12 +1631,17 @@ def main():
                     i, e = errors[0]
                     raise RuntimeError(f"fit failed on block {i}: {e}") from e
             else:
-                for i in range(n_blocks):
+                for i in todo:
                     fit_mses[i] = fit_one(i)
-            with open(os.path.join(fit_dir, "mse.json"), "w", encoding="utf-8") as f:
-                json.dump(fit_mses, f)
-            with open(fit_meta_p, "w", encoding="utf-8") as f:
-                json.dump(fit_sig, f)
+            _save_json_atomic(os.path.join(fit_dir, "mse.json"), fit_mses)
+            if router_stats:
+                _save_json_atomic(os.path.join(fit_dir, "router_meta.json"),
+                                  router_stats)
+            _save_json_atomic(fit_meta_p, fit_sig)
+            try:                            # the fit is complete: partial
+                os.remove(partial_p)        # resume bookkeeping is done
+            except OSError:
+                pass
 
 
     # ========== STAGE 5b - refine rounds (self-distillation) ==================
@@ -1331,9 +1671,7 @@ def main():
                                          map_location="cpu")
                         fm = FieldSparseMoe(ini["geom"], args.rank, gate_w=ini["gw"],
                                             act_fn=act, gate_bias=ini.get("eb"),
-                                            shared=ini.get("shared"),
-                                            mode="norouter" if args.replace_router else "router",
-                                            norouter_hidden=args.norouter_hidden)
+                                            shared=ini.get("shared"))
                         fit = torch.load(os.path.join(fit_dir, f"fit_blk{i}.pt"),
                                          map_location="cpu")
                         with torch.no_grad():
@@ -1361,10 +1699,17 @@ def main():
                         chunk_Y[i].append(y)
                         chunk_n[i] += x.shape[0]
 
+                    chunk_flush_at = refine_flush_at(ram_gb(available=True))
+                    if chunk_flush_at != 8192:
+                        print(f"refine capture: flushing pair chunks at "
+                              f"{chunk_flush_at} pairs (low RAM - smaller "
+                              f"disk chunks, resident ~= one batch ~0.4 GB "
+                              f"instead of ~1.1 GB)", flush=True)
+
                     def flush_chunk(i, force=False):
                         # flush a chunk once it is big enough (bounded RAM),
                         # or whatever remains at the end of the pass
-                        if chunk_n[i] and (force or chunk_n[i] >= 8192):
+                        if chunk_n[i] and (force or chunk_n[i] >= chunk_flush_at):
                             p = os.path.join(refit_dir,
                                              f"pairs_blk{i}_p{len(stores[i]):02d}.pt")
                             save_pairs_block(chunk_X[i], chunk_Y[i], p)
@@ -1394,12 +1739,21 @@ def main():
                     gen2 = torch.Generator().manual_seed(11 + rnd)
                     batches2 = make_batches(calib_ids, args.calib_ctx, args.calib_bsz,
                                             args.calib_windows, device, gen2)
-                    for batch in batches2:
+                    n_windows2 = len(batches2)
+                    for wi, batch in enumerate(batches2, 1):
                         runner2(**batch)
                         for i in range(n_blocks):
                             flush_chunk(i)
+                        # 2026-09-05.2: per-window progress - in the wild this
+                        # pass froze silently (swap-storm); a moving line
+                        # makes "working" vs "stuck" distinguishable.
+                        print(f"\r    ... refine capture: window {wi}/"
+                              f"{n_windows2}, pairs {min(chunk_n)}.."
+                              f"{max(chunk_n)} of {args.per_layer_cap}".
+                              ljust(100), end="", flush=True)
                         if all(chunk_n[i] >= args.per_layer_cap for i in range(n_blocks)):
                             break
+                    print()
                     for h in hooks2:
                         h.remove()
                     for i in range(n_blocks):
@@ -1412,6 +1766,7 @@ def main():
                               flush=True)
                     # 3) warm-started refit on the refine pairs
                     ref_mses = []
+                    router_stats = {}
                     for i in range(n_blocks):
                         Xs, Ys = [], []
                         for p in sorted(_glob.glob(os.path.join(
@@ -1425,31 +1780,54 @@ def main():
                                          map_location="cpu")
                         prev = torch.load(os.path.join(fit_dir, f"fit_blk{i}.pt"),
                                           map_location="cpu")
-                        def make_mod():
-                            return FieldSparseMoe(ini["geom"], args.rank,
-                                                  gate_w=ini["gw"], act_fn=act,
-                                                  gate_bias=ini.get("eb"),
-                                                  shared=ini.get("shared"),
-                                                  init=prev,
-                                                  mode="norouter" if args.replace_router else "router",
-                                                  norouter_hidden=args.norouter_hidden).to(device)
-
-                        fit_mod, mse = fit_block_with_retry(
-                            fit_field_module, make_mod, Xi, Yi, args.fit_lr,
-                            args.fit_steps, args.fit_bs, device,
-                            log_prefix=f"block {i}/{n_blocks} r{rnd}",
-                            guard=not args.skip_fit_guard,
-                            method=args.fit_method,
-                            seed=1000 * rnd + 5 + i,
-                            jitter=args.fit_jitter,
-                            early_stop=args.fit_early_stop,
-                            muon_max_dim=args.muon_max_dim or MUON_NS_MAX_DIM,
-                            log_every=args.fit_log_every,
-                            autocast=args.fit_autocast,
-                            muon_ns_steps=args.muon_ns_steps)
-                        torch.save({n: getattr(fit_mod, n).detach().clone()
-                                    for n in fit_mod.field_names},
-                                   os.path.join(fit_dir, f"fit_blk{i}.pt"))
+                        fit_mod = FieldSparseMoe(ini["geom"], args.rank,
+                                                 gate_w=ini["gw"], act_fn=act,
+                                                 gate_bias=ini.get("eb"),
+                                                 shared=ini.get("shared"),
+                                                 init=prev).to(device)
+                        if "gw_tuned" in prev:
+                            with torch.no_grad():   # keep the tuned router
+                                fit_mod.gw.copy_(prev["gw_tuned"])
+                        mse = fit_field_module(fit_mod, Xi, Yi, args.fit_steps,
+                                               args.fit_bs, args.fit_lr, device,
+                                               log_prefix=f"block {i}/{n_blocks} r{rnd}",
+                                               guard=not args.skip_fit_guard,
+                                               method=args.fit_method,
+                                               seed=1000 * rnd + 5 + i,
+                                               jitter=args.fit_jitter,
+                                               early_stop=args.fit_early_stop,
+                                               guard_warmup=(None
+                                                             if args.fit_guard_warmup < 0
+                                                             else args.fit_guard_warmup),
+                                               strict_guard=args.strict_fit_guard,
+                                               lr_warmup=args.fit_lr_warmup,
+                                               train_router=(args.fit_router == "joint"),
+                                               router_anchor=args.router_anchor,
+                                               autocast=args.fit_autocast,
+                                               muon_max_dim=args.muon_max_dim,
+                                               muon_ns_steps=args.muon_ns_steps)
+                        if args.fit_router == "after":
+                            pr_stat = polish_router_module(
+                                fit_mod, Xi, Yi, args.router_steps, args.fit_bs,
+                                router_lr, device, anchor=args.router_anchor,
+                                log_prefix=f"block {i}/{n_blocks} r{rnd} router",
+                                seed=1000 * rnd + 5 + i)
+                            router_stats[i] = pr_stat
+                        elif args.fit_router == "joint":
+                            router_stats[i] = dict(drift=float(
+                                (fit_mod.gw.detach() - ini["gw"].float()).norm()
+                                / ini["gw"].float().norm().clamp_min(1e-12)))
+                        out = {n: getattr(fit_mod, n).detach().clone()
+                               for n in fit_mod.field_names}
+                        if args.fit_router != "off":
+                            out["gw_tuned"] = fit_mod.gw.detach().clone()
+                        torch.save(out, os.path.join(fit_dir, f"fit_blk{i}.pt"))
+                        if args.fit_router == "after":
+                            router_stats[i] = pr_stat
+                        elif args.fit_router == "joint":
+                            router_stats[i] = dict(drift=float(
+                                (fit_mod.gw.detach() - ini["gw"].float()).norm()
+                                / ini["gw"].float().norm().clamp_min(1e-12)))
                         del fit_mod, Xi, Yi
                         gc.collect()
                         ref_mses.append(mse)
@@ -1457,6 +1835,10 @@ def main():
                     with open(os.path.join(fit_dir, "mse.json"), "w",
                               encoding="utf-8") as f:
                         json.dump(fit_mses, f)
+                    if router_stats:
+                        with open(os.path.join(fit_dir, "router_meta.json"),
+                                  "w", encoding="utf-8") as f:
+                            json.dump(router_stats, f)
                     print(f"refine round {rnd} done: fits updated "
                           f"(warm start from the previous round)", flush=True)
                     T["refine_rounds"] = rnd
@@ -1490,21 +1872,17 @@ def main():
                        fit_method=args.fit_method, fit_steps=args.fit_steps,
                        fit_bs=args.fit_bs, fit_lr=args.fit_lr,
                        fit_jitter=args.fit_jitter, fit_early_stop=args.fit_early_stop,
+                       fit_router=args.fit_router,
+                       fit_guard_warmup=args.fit_guard_warmup,
+                       fit_lr_warmup=args.fit_lr_warmup,
                        fit_preset=fit_preset or "none", fit_workers=args.fit_workers,
                        io_threads=args.io_threads,
                        prefetch=args.prefetch, io_cache=args.io_cache,
-                       per_layer_cap=args.per_layer_cap,
-                       muon_max_dim=args.muon_max_dim or MUON_NS_MAX_DIM,
-                       replace_router=bool(args.replace_router),
-                       norouter_hidden=args.norouter_hidden)
+                       per_layer_cap=args.per_layer_cap)
         write_field_artifact(src, out_dir, pool_dir, fit_dir, args.rank, dtype,
                              gguf=light_gguf, profile=profile,
-                             io_workers=args.io_threads, io_cache=args.io_cache,
-                             replace_router=args.replace_router,
-                             norouter_hidden=args.norouter_hidden)
-        full_b, field_b = field_accounting(
-            geoms, args.rank,
-            norouter_hidden=args.norouter_hidden if args.replace_router else None)
+                             io_workers=args.io_threads, io_cache=args.io_cache)
+        full_b, field_b = field_accounting(geoms, args.rank)
         T.update(rank=args.rank, full_experts_mb=full_b / 1e6, field_mb=field_b / 1e6,
                  ratio=full_b / max(field_b, 1), fit_mses=fit_mses,
                  cache_dir=pool_dir, fit_dir=fit_dir, phased_flow=True,
@@ -1531,6 +1909,13 @@ def main():
             art = AutoModelForCausalLM.from_pretrained(
                 out_dir, dtype=dtype, trust_remote_code=True,
                 low_cpu_mem_usage=True).to(device).eval()
+        if X is None or Y is None:
+            # resumed runs: phase A loaded the eval tokens only when the whole
+            # cache was complete - the verify math needs just the tokens, and
+            # they are deterministic (fixed-seed chunks saved on disk)
+            d = torch.load(os.path.join(pool_dir, "eval_tokens.pt"),
+                           map_location="cpu")
+            X, Y, eval_ids = d["X"], d["Y"], d.get("eval_ids", eval_ids)
         field_m = eval_vs_cache_disk(art, X, Y, lp_dir)
         field_gen = None
         if args.gen_tokens > 0:
@@ -1604,7 +1989,13 @@ def write_report(args, out_dir):
                   f"{pr.get('fit_method')}/{pr.get('fit_steps')} steps/"
                   f"bs {pr.get('fit_bs')}/lr {pr.get('fit_lr')}"
                   f" (preset {pr.get('fit_preset')}) | workers "
-                  f"{pr.get('fit_workers')} | prefetch {pr.get('prefetch')}")
+                  f"{pr.get('fit_workers')} | prefetch {pr.get('prefetch')}"
+                  + (f" | router: {pr.get('fit_router')}"
+                     if pr.get("fit_router", "off") != "off" else "")
+                  + (f" | guard warmup {pr.get('fit_guard_warmup')}"
+                     if pr.get("fit_guard_warmup") not in (None, -1) else "")
+                  + (f" | lr warmup {pr.get('fit_lr_warmup')}"
+                     if pr.get("fit_lr_warmup") else ""))
     if T.get("plan"):
         md.append(f"Stages run: {' -> '.join(T['plan'])}"
                   + (f" | skipped: {', '.join(T['plan_skipped'])}"

@@ -1,3 +1,14 @@
+# version: 2026-09-05.2 - SWAP-STORM GUARD: a tight box does not always raise
+#   MemoryError - Windows slides into a swap-storm (allocations succeed via
+#   the pagefile, wall-clock dies, the run looks frozen). Two guards: (1)
+#   BlockStreamRunner re-checks io-cache ram at EVERY stage and downgrades to
+#   disk when the packed copy would not fit (MOE_FORCE_IO_RAM=1 overrides);
+#   (2) a RAM watchdog thread drops the ram cache the moment free memory
+#   crosses the floor, before the thrash starts (MOE_NO_RAM_WATCHDOG=1 off).
+# version: 2026-09-05.1 - LOW-RAM FIX: a MemoryError during a block load no
+#   longer kills the run - the io-cache ram GGUF copy (~= packed file size) is
+#   dropped and the block load retries from disk/mmap (BlockStreamRunner
+#   ._degrade_ram_cache; prefetch is disabled alongside, it doubles the peak).
 """Streaming MoE model run at low RAM: the full model is NEVER materialized.
 
 Why: at stages 3-4 the pipeline used to load the whole model (~14 GB bf16 for
@@ -33,6 +44,7 @@ The calibration activation pool is collected in the same pass: (MoE input ->
 output) pairs are captured by hooks and depend on neither text order nor
 context - the fit samples them as independent vectors (bootstrap inference).
 """
+import gc
 import os
 import queue
 import threading
@@ -42,6 +54,61 @@ import torch
 import torch.nn as nn
 
 from hf_field_transform import find_moe_blocks
+
+
+def free_ram_gb():
+    """GB of AVAILABLE RAM; None when it cannot be measured. psutil ->
+    /proc/meminfo -> Windows GlobalMemoryStatusEx; never raises."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1e9
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            info = {}
+            for line in f:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    info[k] = int(v.strip().split()[0]) * 1024
+        return info.get("MemAvailable", info.get("MemTotal", 0)) / 1e9
+    except Exception:
+        pass
+    try:
+        import ctypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        st = _MemStatus()
+        st.dwLength = ctypes.sizeof(_MemStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return st.ullAvailPhys / 1e9
+    except Exception:
+        pass
+    return None
+
+
+def ram_cache_fits(avail_gb, gguf_gb):
+    """Whether the io-cache ram packed copy may be armed (2026-09-05.2).
+
+    The cache is ~= the packed GGUF size, and it grows WHILE the working set
+    (backbone + capture chunks + dequant scratch) is live. Seen in the wild:
+    3.2 GB free + a 2.8 GB GGUF -> around block 13 of the first refine window
+    Windows entered a swap-storm - allocations kept succeeding through the
+    pagefile, so no MemoryError ever fired and the run just froze. The bar is
+    therefore deliberately generous: 1.5x the GGUF + 1 GB headroom. An
+    unmeasurable amount of RAM never second-guesses the user."""
+    if avail_gb is None:
+        return True
+    return avail_gb >= gguf_gb * 1.5 + 1.0
 
 
 class BlockStreamRunner:
@@ -61,6 +128,7 @@ class BlockStreamRunner:
         self.progress = bool(progress)
         self._io_workers = max(1, int(io_workers))   # GGUF dequant threads
         self._io_cache = str(io_cache)               # disk | ram (packed cache)
+        self._oom_hint = False        # ram cache already dropped on an OOM
         self._gguf = self._open_gguf(gguf)   # weight source: None -> safetensors
         cfg = AutoConfig.from_pretrained(src)
         with torch.device("meta"):
@@ -90,11 +158,16 @@ class BlockStreamRunner:
         self._pf_thread = None
         self._pf_dead = False       # worker failed -> sync fallback
         self._pf_hint = False
+        # RAM watchdog (2026-09-05.2) - swap-storm guard
+        self._wd_stop = threading.Event()
+        self._wd_thread = None
+        self._wd_poll = 2.0         # seconds between free-RAM samples
         self._fix_buffers()
         self._load_backbone(src)
         self._map_expert_keys(src)
         self._install_hooks()
         self._start_prefetch()
+        self._start_ram_watchdog()
         gp = os.path.join(src, "generation_config.json")
         if os.path.exists(gp):
             self.model.generation_config = GenerationConfig.from_pretrained(src)
@@ -129,9 +202,27 @@ class BlockStreamRunner:
             return None
         from hf_gguf_to_hf import GgufHfSource
         if self._io_cache == "ram":
-            print(f"streaming: io-cache ram - raw GGUF tensors are copied to "
-                  f"RAM on first touch (~= the packed file size, ~2.7 GB for a "
-                  f"1B Q8 MoE); later passes read nothing from disk", flush=True)
+            # 2026-09-05.2: re-check at EVERY stage (free RAM measured at
+            # stage 0 says nothing about stage 5b) - an explicit request is
+            # still honored only when it cannot swap-storm the machine.
+            use_ram = True
+            try:
+                size_gb = os.path.getsize(gguf) / 1e9
+            except OSError:
+                size_gb = None
+            avail_gb = free_ram_gb()
+            if size_gb is not None and not ram_cache_fits(avail_gb, size_gb) \
+                    and os.environ.get("MOE_FORCE_IO_RAM") != "1":
+                use_ram = False
+                self._io_cache = "disk"
+                print(f"streaming: io-cache ram DOES NOT FIT this machine "
+                      f"({size_gb:.1f} GB GGUF, {avail_gb:.1f} GB free - it "
+                      f"would swap-storm) -> reading from disk instead "
+                      f"(MOE_FORCE_IO_RAM=1 overrides)", flush=True)
+            if use_ram:
+                print(f"streaming: io-cache ram - raw GGUF tensors are copied to "
+                      f"RAM on first touch (~= the packed file size, ~2.7 GB for a "
+                      f"1B Q8 MoE); later passes read nothing from disk", flush=True)
         return GgufHfSource(gguf, io_workers=self._io_workers,
                             cache_ram=(self._io_cache == "ram"))
 
@@ -391,6 +482,65 @@ class BlockStreamRunner:
                 return
 
     # ------------------------------------------------------------ load/free
+    def _degrade_ram_cache(self, reason="OOM"):
+        """OOM recovery (2026-09-05.1; reason param 2026-09-05.2): the
+        packed-GGUF RAM cache (io-cache ram) is a pure optimization - when an
+        allocation fails (or the RAM watchdog sees free memory crossing the
+        floor), drop it and read from disk/mmap for the rest of the run
+        instead of crashing or swap-storming. Seen in the wild: a 2.8 GB GGUF
+        with 3.2 GB free - backbone + ram cache + one dequant scratch do not
+        fit, stage 4 died with "Unable to allocate 128 MiB". Prefetch is
+        disabled alongside (it keeps a whole extra block in RAM)."""
+        dropped = False
+        if self._gguf is not None and getattr(self._gguf, "cache_ram", False):
+            try:
+                self._gguf.drop_ram_cache()
+                dropped = True
+            except AttributeError:      # a weight source without a ram cache
+                self._gguf.cache_ram = False
+            except Exception:  # noqa: BLE001
+                pass
+        with self._pf_lock:
+            self._pf_buf.clear()
+            self._pf_dead = True
+        gc.collect()
+        if dropped and not self._oom_hint:
+            self._oom_hint = True
+            print(f"\n    ({reason}: dropped the io-cache ram GGUF copy - "
+                  f"continuing from disk/mmap; the ram cache does not fit this "
+                  f"machine, next time run with --io-cache disk)", flush=True)
+        return dropped
+
+    # ------------------------------------------------------------ watchdog
+    def _start_ram_watchdog(self):
+        """2026-09-05.2: the io-cache ram copy grows block by block, and on a
+        tight box Windows may respond with a swap-storm instead of a
+        MemoryError (the refine capture pass froze there in the wild: 13 block
+        loads, then nothing). A daemon thread samples free RAM and drops the
+        cache the moment it crosses the floor - BEFORE the thrash starts."""
+        if self._gguf is None or not getattr(self._gguf, "cache_ram", False):
+            return
+        if os.environ.get("MOE_NO_RAM_WATCHDOG") == "1":
+            return
+        try:
+            self._wd_thread = threading.Thread(
+                target=self._ram_watchdog_loop, name="moe-ram-watchdog",
+                daemon=True)
+            self._wd_thread.start()
+        except Exception:
+            self._wd_thread = None
+
+    def _ram_watchdog_loop(self):
+        while not self._wd_stop.wait(self._wd_poll):
+            gguf = self._gguf
+            if gguf is None or not getattr(gguf, "cache_ram", False):
+                return                  # cache already gone - nothing to guard
+            avail = free_ram_gb()
+            if avail is not None and avail < 0.6:
+                self._degrade_ram_cache(
+                    reason=f"watchdog: only {avail:.1f} GB RAM left")
+                return
+
     def _make_pre(self, prefix):
         def pre(module, args):
             if self._pinned is None and self._loaded != prefix:
@@ -419,17 +569,28 @@ class BlockStreamRunner:
         with self._pf_lock:
             pre = self._pf_buf.pop(prefix, None) if self._pf_thread is not None \
                 else None
-        if pre is None:
+        try:
+            if pre is None:
+                for fn, key in self._expert_keys[prefix]:
+                    t = self._get_weight(fn, key)
+                    self._assign(key, t)
+                    nb += bytes_of(fn, key, t)
+                    del t
+            else:
+                for fn, key in self._expert_keys[prefix]:
+                    t = pre.get(key)
+                    if t is None:                   # partial buffer - fallback
+                        t = self._get_weight(fn, key)
+                    self._assign(key, t)
+                    nb += bytes_of(fn, key, t)
+                    del t
+        except MemoryError:
+            # io-cache ram does not fit this machine: drop the packed GGUF
+            # copy (+~2-3 GB) and retry the whole block from disk/mmap. The
+            # partial _assign above is safe to redo: swap_tensors is idempotent.
+            self._degrade_ram_cache()
             for fn, key in self._expert_keys[prefix]:
                 t = self._get_weight(fn, key)
-                self._assign(key, t)
-                nb += bytes_of(fn, key, t)
-                del t
-        else:
-            for fn, key in self._expert_keys[prefix]:
-                t = pre.get(key)
-                if t is None:                       # partial buffer - fallback
-                    t = self._get_weight(fn, key)
                 self._assign(key, t)
                 nb += bytes_of(fn, key, t)
                 del t
@@ -479,6 +640,8 @@ class BlockStreamRunner:
             return False
 
     def close(self):
+        self._wd_stop.set()          # stop the RAM watchdog
+        self._wd_thread = None
         if self._pf_thread is not None:
             try:
                 self._pf_queue.put_nowait(None)
