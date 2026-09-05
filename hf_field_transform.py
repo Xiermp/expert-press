@@ -1,3 +1,13 @@
+# version: 2026-09-05.6 - JOINT SVD INIT: the field consumes DIAGONAL
+#   per-expert coordinates in a shared (U,V) basis, but the old builder chose
+#   U and V by two SEPARATE top-eigh problems - the diagonal then keeps only
+#   ~capture_proj/r of the delta energy (rank 128 -> ~1%, the fit starts
+#   statistically indistinguishable from the centroid: "step-0 = centroid" in
+#   the guard is NOT proof the init did not load). expert_basis_init now runs
+#   a guarded coordinate ascent that maximizes the DIAGONAL objective itself
+#   (cheap: everything on the stashed projected deltas; measured 1.5-10x
+#   capture on synthetic blocks), stamps files with svd_ver, and the pipeline
+#   rebuilds stale-version files automatically (see hf_pipeline 2026-09-05.6).
 # version: 2026-09-04.3 - RESUME FIX: save_pairs_block is atomic (tmp +
 #   os.replace) - an interrupted flush cannot leave a torn pairs_blk file;
 #   eval_logits_cache_disk reuses existing loadable lp_XXX.pt chunks (the
@@ -1152,6 +1162,82 @@ def _iter_expert_w(block):
     raise RuntimeError(f"cannot extract experts from {type(exp).__name__}")
 
 
+SVD_INIT_VER = "joint-v1"          # bump when the init algorithm changes:
+                                   # stale-version files are rebuilt on the
+                                   # next run and the fit re-runs (sig)
+
+
+@torch.no_grad()
+def _diag_capture_of(U_B, V, B):
+    """F = sum_e ||diag(U_B^T B_e V)||^2 - the exact step-0 delta energy the
+    field's diagonal coordinates keep for the bases (U_B, V). Batched: two
+    (n,r,in)-sized matmuls, no fp64, no per-expert loop."""
+    P = torch.matmul(torch.matmul(U_B.t(), B), V)             # (n,r,r)
+    return float(torch.diagonal(P, dim1=-2, dim2=-1).pow(2).sum())
+
+
+@torch.no_grad()
+def _joint_align_diag(U_B0, V0, B, sweeps=4, power=15, seed=1234):
+    """Coordinate ascent on the DIAGONAL capture objective
+    F(U,V) = sum_e sum_k (u_k^T B_e v_k)^2 over orthonormal bases - the exact
+    quantity the field's init reconstruction U diag(C_e) V^T keeps (the old
+    separate top-eigh pair maximizes the Frobenius projection instead, which
+    leaves the diagonal ~1/r of it). Alternating exact/cheap updates:
+      u_k: top eigvec of the deflated (q,q) problem  P (sum_e b b^T) P,
+           b = B_e v_k  (q = rank+oversample - tiny);
+      v_k: power iteration on P (sum_e B_e^T u_k u_k^T B_e) P in the input
+           space (only (n,in) matvecs; the input dim never forms a matrix).
+    NOTE: the ascent is NOT monotone - the orthogonality constraints couple
+    the columns, and a locally worse u_k can unlock a much better v_k later
+    (measured: 1% -> 6% through a deliberately accepted dip). So the updates
+    are unguarded and the BEST state seen along the trajectory is returned;
+    the caller still falls back to (U_B0, V0) unless that best beats the
+    separate-eigh start, so the result can only improve on the old init.
+    All work happens on the already-stashed projected deltas B - the expert
+    weights are NOT touched again."""
+    g = torch.Generator().manual_seed(seed)
+    n, q, in_dim = B.shape
+    r = U_B0.shape[1]
+    U, V = U_B0.clone(), V0.clone()
+    eye_q = torch.eye(q)
+    f_best = _diag_capture_of(U, V, B)
+    bU, bV = U.clone(), V.clone()
+    for _ in range(sweeps):
+        BV = torch.matmul(B, V)                               # (n,q,r)
+        for k in range(r):
+            BVk = BV[:, :, k]                                 # (n,q)
+            M = torch.einsum("eq,es->qs", BVk, BVk)
+            Uo = torch.cat([U[:, :k], U[:, k + 1:]], dim=1)
+            P = eye_q - Uo @ Uo.t()
+            M2 = P @ M @ P
+            _, vecs = torch.linalg.eigh(0.5 * (M2 + M2.t()))
+            U[:, k] = vecs[:, -1]
+        for k in range(r):
+            u = U[:, k]
+            A = torch.stack([B[e].t() @ u for e in range(n)])  # (n,in)
+            Vo = torch.cat([V[:, :k], V[:, k + 1:]], dim=1)
+            v = torch.randn(in_dim, generator=g)
+            v = v - Vo @ (Vo.t() @ v)
+            vn = v.norm()
+            if vn < 1e-9:
+                v = torch.randn(in_dim, generator=g)
+                v = v - Vo @ (Vo.t() @ v)
+                vn = v.norm()
+            v = v / vn
+            for _ in range(power):
+                w = A.t() @ (A @ v)
+                w = w - Vo @ (Vo.t() @ w)
+                wn = w.norm()
+                if wn < 1e-12:
+                    break
+                v = w / wn
+            V[:, k] = v
+        f = _diag_capture_of(U, V, B)
+        if f > f_best:
+            f_best, bU, bV = f, U.clone(), V.clone()
+    return bU, bV, f_best
+
+
 @torch.no_grad()
 def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
                       log_prefix=""):
@@ -1212,9 +1298,19 @@ def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
             continue
         G_out_q = sum(B[e] @ B[e].t() for e in range(n_exp))     # (q,q)
         G_in_p = sum(B[e].t() @ B[e] for e in range(n_exp))      # (in,in)
-        U_B, _ = _topk_eigh(G_out_q, rank, oversample, seed + 1)
+        U_B0, _ = _topk_eigh(G_out_q, rank, oversample, seed + 1)
+        V0, _ = _topk_eigh(G_in_p, rank, oversample, seed + 2)
+        # 2026-09-05.6 (hole-1b): the separate top-eigh pair leaves the
+        # DIAGONAL coordinates ~capture_proj/r of the delta energy (rank 128
+        # -> ~1% - the fit started effectively blind even with the files
+        # loaded). The guarded ascent maximizes the diagonal objective
+        # itself; fall back to the separate pair if it gains nothing.
+        U_Bj, Vj, f_joint = _joint_align_diag(U_B0, V0, B)
+        if f_joint > _diag_capture_of(U_B0, V0, B):
+            U_B, V = U_Bj, Vj
+        else:
+            U_B, V = U_B0, V0
         U = Q @ U_B
-        V, _ = _topk_eigh(G_in_p, rank, oversample, seed + 2)
         # coordinates from the stash: U^T dW_e V = U_B^T B_e V (exact within
         # range(Q), which the oversampled range finder makes negligible)
         C = torch.stack([torch.diagonal(U_B.t() @ B[e] @ V)
@@ -1234,9 +1330,10 @@ def expert_basis_init(block, mgu, mdn, rank, oversample=16, seed=917,
         init[f"capture_proj_{side}"] = float((K ** 2).sum()) \
             / max(den[side], 1e-12)
     init["capture"] = capture
+    init["svd_ver"] = SVD_INIT_VER
     parts = [f"{s} {capture[s] * 100:.1f}%" for s in ("gu", "dn") if s in capture]
-    print(f"    {log_prefix} svd init: delta energy captured at step 0 - "
-          + ", ".join(parts), flush=True)
+    print(f"    {log_prefix} svd init ({SVD_INIT_VER}, joint-aligned): "
+          "delta energy captured at step 0 - " + ", ".join(parts), flush=True)
     return init
 
 

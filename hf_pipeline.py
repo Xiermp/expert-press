@@ -1,3 +1,14 @@
+# version: 2026-09-05.6 - POOL/SVD-VERSION-AWARE FIT SIG + JOINT INIT UPGRADE:
+#   (1) fit_sig now fingerprints the POOL (per-block pair counts) and the SVD
+#   init version - before, a --pool-recalibrate with a bigger cap silently
+#   KEPT the old fit (the sig did not see the pool), and better init files
+#   did not re-trigger the fit either. (2) init_svd_blk*.pt carry svd_ver;
+#   files built by an OLDER init algorithm are rebuilt automatically by the
+#   same self-heal that covers missing files (2026-09-05.5), so upgrading
+#   needs no flags and no manual deletions. (3) the stage-5 banner now shows
+#   the EFFECTIVE init (it was printed before the effective value existed,
+#   always reading like "svd init"), and the fit log prints the init's
+#   step-0 delta-energy capture so an uninformative init is visible.
 # version: 2026-09-05.5 - SVD-INIT SELF-HEAL: missing fit_dir/init_svd_blk*.pt
 #   (pool cache from a pre-SVD build, or an earlier run that fell back to the
 #   random init) are detected BEFORE the fit and rebuilt by a streaming pass
@@ -490,6 +501,20 @@ def resolve_plan(args):
         print(f"note: --refine-rounds {args.refine_rounds} ignored - 'refine' is "
               f"not in the plan", flush=True)
     return [s for s in STAGE_ORDER if s in wanted]
+
+
+def _svd_file_ver(path):
+    """init_svd_blk file freshness: 'missing' | 'corrupt' | its svd_ver stamp
+    ('v0' = built before 2026-09-05.6). The fit and the self-heal key on this
+    so an upgrade (or a corrupt file) rebuilds the init instead of silently
+    fitting from a weaker/older basis."""
+    if not os.path.isfile(path):
+        return "missing"
+    try:
+        import torch as _t
+        return str(_t.load(path, map_location="cpu").get("svd_ver", "v0"))
+    except Exception:                                  # noqa: BLE001
+        return "corrupt"
 
 
 def fit_blocks_ok(fit_dir, n):
@@ -1016,7 +1041,8 @@ def main():
                                     generate_text, load_pairs_block,
                                     make_batches, polish_router_module,
                                     router_weight, save_pairs_block,
-                                    write_field_artifact, FieldSparseMoe)
+                                    write_field_artifact, FieldSparseMoe,
+                                    SVD_INIT_VER)
     from hf_stream import BlockStreamRunner
     if args.threads:
         torch.set_num_threads(args.threads)
@@ -1208,14 +1234,18 @@ def main():
     svd_heal = False
     if ("fit" in plan and args.fit_init == "svd" and not args.refresh_init
             and pool_cache):
-        svd_heal = not all(os.path.isfile(os.path.join(
-            fit_dir, f"init_svd_blk{i}.pt")) for i in range(pool_cache))
+        stale = [i for i in range(pool_cache)
+                 if _svd_file_ver(os.path.join(fit_dir,
+                                               f"init_svd_blk{i}.pt"))
+                 != SVD_INIT_VER]
+        svd_heal = bool(stale)
         if svd_heal:
-            print(f"SVD init check: init_svd_blk*.pt missing for rank "
-                  f"{args.rank} ({pool_cache} blocks) - a streaming pass "
-                  f"will build them from the expert weights (~minutes: one "
-                  f"expert read per block, no model forward). An existing "
-                  f"random-init fit for this rank is re-fitted afterwards.",
+            print(f"SVD init check: {len(stale)}/{pool_cache} "
+                  f"init_svd_blk*.pt are missing or built by an older init "
+                  f"algorithm (current: {SVD_INIT_VER}) - a streaming pass "
+                  f"will rebuild them from the expert weights (~minutes: one "
+                  f"expert read per block, no model forward). The fit for "
+                  f"this rank is re-fitted afterwards.",
                   flush=True)
             calib_pass = True  # force the streaming pass (experts on disk)
     refresh_only = False
@@ -1427,16 +1457,16 @@ def main():
             for i, (_, block) in enumerate(blocks):
                 ipath = os.path.join(pool_dir, f"init_blk{i}.pt")
                 spath = os.path.join(fit_dir, f"init_svd_blk{i}.pt")
-                svd_missing = (args.fit_init == "svd"
-                               and not os.path.isfile(spath))
-                if refresh_only and not svd_missing:
+                svd_stale = (args.fit_init == "svd"
+                             and _svd_file_ver(spath) != SVD_INIT_VER)
+                if refresh_only and not svd_stale:
                     # resumable --refresh-init: existing files are kept
-                    # (delete fit_dir/init_svd_blk*.pt to force a rebuild)
+                    # (stale-version files are rebuilt by the same pass)
                     print(f"  block {i}/{len(blocks)}: init_svd_blk{i}.pt "
                           f"already exists - skipped", flush=True)
                     continue
                 cached = (not refresh_only and os.path.isfile(ipath))
-                if cached and not svd_missing:
+                if cached and not svd_stale:
                     # resumable stage 4: this block's init survived the last
                     # run (and its SVD init exists or is not wanted) - inits
                     # depend only on the model, never recompute
@@ -1459,14 +1489,14 @@ def main():
                             mgu, mdn = ini["mgu"], ini["mdn"]
                         else:
                             mgu, mdn = expert_means(block)
-                        if svd_missing:
+                        if svd_stale:
                             svd_done += _save_svd_init(i, block, mgu, mdn)
                 else:
                     if ini is not None:          # cached centroids (heal)
                         mgu, mdn = ini["mgu"], ini["mdn"]
                     else:
                         mgu, mdn = expert_means(block)  # without an fp32 expert stack
-                    if svd_missing:
+                    if svd_stale:
                         svd_done += _save_svd_init(i, block, mgu, mdn)
                 if refresh_only:
                     continue
@@ -1537,16 +1567,34 @@ def main():
         except Exception:
             pass
     else:
-        banner(f"STAGE 5 - field fit r={args.rank} on pairs from disk "
-               f"({args.fit_method}, "
-               f"{T.get('fit_init_effective', args.fit_init)} init, "
-               f"model NOT in RAM)")
         os.makedirs(fit_dir, exist_ok=True)
         svd_files = [os.path.join(fit_dir, f"init_svd_blk{i}.pt")
                      for i in range(n_blocks)]
         svd_ready = (args.fit_init == "svd"
                      and all(os.path.isfile(f) for f in svd_files))
         T["fit_init_effective"] = "svd" if svd_ready else "random"
+        # 2026-09-05.6: the freshness scan happens BEFORE the banner (it used
+        # to be printed with the configured value - a silent random fallback
+        # still read "svd init"), and the init's step-0 capture is printed so
+        # an uninformative init is visible instead of being guessed from the
+        # guard numbers.
+        sig_svd_ver = "none"
+        if svd_ready:
+            vers = {_svd_file_ver(f) for f in svd_files}
+            sig_svd_ver = vers.pop() if len(vers) == 1 else "mixed"
+            if sig_svd_ver not in ("corrupt", "mixed"):
+                try:
+                    import torch as _t
+                    cap0 = _t.load(svd_files[0], map_location="cpu").get("capture") or {}
+                    parts = [f"{s} {v * 100:.1f}%" for s, v in cap0.items()]
+                    if parts:
+                        print(f"SVD init ({sig_svd_ver}): delta energy captured "
+                              f"at step 0 - " + ", ".join(parts) + " (step-0 "
+                              f"mse sits ~(1-capture) x the pure-centroid "
+                              f"line; ~1% means the init is effectively "
+                              f"blind for this rank)", flush=True)
+                except Exception:                          # noqa: BLE001
+                    pass
         if args.fit_init == "svd" and not svd_ready:
             print("WARNING: --fit-init svd but init_svd_blk*.pt are missing "
                   "for this rank - fitting from the RANDOM init (~3x more "
@@ -1554,6 +1602,10 @@ def main():
                   "the pipeline self-heals this before the fit - if you still "
                   "see this WARNING, check the log above for a failed "
                   "streaming pass.", flush=True)
+        banner(f"STAGE 5 - field fit r={args.rank} on pairs from disk "
+               f"({args.fit_method}, "
+               f"{T['fit_init_effective']} init, "
+               f"model NOT in RAM)")
         fit_sig = dict(fit_steps=args.fit_steps, fit_bs=args.fit_bs, fit_lr=args.fit_lr,
                        fit_method=args.fit_method, fit_jitter=args.fit_jitter,
                        fit_early_stop=args.fit_early_stop,
@@ -1569,6 +1621,8 @@ def main():
                        muon_max_dim=args.muon_max_dim,
                        muon_ns_steps=args.muon_ns_steps,
                        init=("svd" if svd_ready else "random"),
+                       svd_ver=sig_svd_ver,
+                       pool=[int(n) for _, n in (pairs or [])],
                        preset=fit_preset or "none")
         fit_meta_p = os.path.join(fit_dir, "fit_meta.json")
         fit_done = fit_blocks_ok(fit_dir, n_blocks) and os.path.isfile(fit_meta_p)

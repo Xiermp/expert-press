@@ -450,3 +450,86 @@ read per block), re-fit all blocks from the SVD init (the expensive part,
 unavoidable - the blind fit must be re-taught), redo the refine rounds on
 top, rebuild the artifact and verify. If you only want to check losses
 without re-fitting: `--stages verify` still works off the existing caches.
+
+# 2026-09-05.6 - JOINT SVD INIT + POOL/SVD-VERSION-AWARE FIT SIG: build 10.8
+
+Files changed: `hf_field_transform.py` (2026-09-05.6), `hf_pipeline.py`
+(2026-09-05.6). No template/runtime changes.
+
+## Context
+Two findings from the user's r128 re-run log (the one with KL 0.688 /
+ppl +31.7%):
+
+1. **The fit started "blind" AGAIN - even with the SVD files present.**
+   Every block's guard showed step-0 mse == the pure-centroid reference
+   (e.g. blk20 0.66051 vs 0.67331). Root cause is NOT the loading path:
+   the field consumes DIAGONAL per-expert coordinates (`dW_e ~=
+   U diag(C_e) V^T`), but `expert_basis_init` chose U and V by two
+   SEPARATE top-eigh problems (output-side Gram, input-side Gram). Such a
+   pair maximizes the Frobenius projection, and the DIAGONAL of a generic
+   projection keeps only ~1/r of it - at rank 128 that is ~1%, i.e. the
+   init is statistically indistinguishable from the centroid at step 0
+   (the 10.7 toy happened to be full-rank, which hid this). The old bench's
+   "diag capture 49-68%" was measured at r << dims with aligned deltas.
+2. **The fit signature did not see the pool.** `--pool-recalibrate` with a
+   bigger cap rebuilt pairs_blk*.pt - and then stage 5 said "fit already
+   cached - skipping", because fit_meta.json fingerprints only the fit
+   hyperparameters. Recalibrating the pool without manually deleting
+   fit_r{R}/ did nothing.
+
+## What was done
+- `expert_basis_init` (hf_field_transform.py): after the separate-eigh
+  start, a COORDINATE ASCENT maximizes the diagonal objective itself,
+  `F(U,V) = sum_e sum_k (u_k^T B_e v_k)^2`: exact top-eigh of the deflated
+  (q,q) problem for the output side, power iteration in the input space
+  (only (n,in) matvecs) for the input side - everything on the already
+  stashed projected deltas, expert weights are NOT re-read. The ascent is
+  non-monotone (a locally worse u_k can unlock a much better v_k), so the
+  BEST state seen is returned and the separate-eigh bases remain the
+  fallback - the result can only improve on 10.7. Measured on synthetic
+  blocks: 1.5-10x capture (generic deltas at r=128: ~0.6% -> ~1-6%;
+  real trained experts with aligned deltas should gain more). Files are
+  stamped `svd_ver = "joint-v1"`, the builder prints the capture.
+- `hf_pipeline.py`:
+  - fit_sig gains `svd_ver` and `pool` (per-block pair counts) -> a
+    recalibrated pool and/or upgraded init files re-trigger the fit
+    automatically; old fit_meta.json files mismatch on the new keys and
+    re-fit as well (the r128 blind fit is re-taught on upgrade).
+  - the self-heal (10.7) now keys on file FRESHNESS, not existence:
+    missing/corrupt/old-version `init_svd_blk*.pt` are rebuilt by the same
+    streaming pass ("SVD init check: N/M ... older init algorithm").
+    Upgrading needs no flags and no manual deletions.
+  - the STAGE-5 banner is printed AFTER the effective-init scan (it used
+    to read the configured value - a silent random fallback still showed
+    "svd init"), and the fit log prints the init's step-0 capture with the
+    interpretation ("~1% means the init is effectively blind for this
+    rank") - an uninformative init is now visible instead of guessable.
+
+## Verification (toy stand + synthetic bench)
+- Synthetic bench (scripts/bench_svd_joint.py): generic deltas, 16 experts,
+  d=256/dff=512/r=64: gu 0.46% -> 0.8-0.9%, dn 1.30% -> 2.8-3.0%; aligned
+  deltas: dn 3.23% -> 3.2% (fallback kept - no regression); r128 case:
+  up to 10x on one realization. Both implementations (bench and library)
+  agree on identical inputs.
+- Toy pipeline end-to-end: "SVD init check: 2/2 ... older init algorithm"
+  -> joint files built with per-block capture prints -> fit re-runs (sig
+  changed) -> verify green (KL ~0, ppl 259.49 vs base 259.51).
+- Re-run: no heal, "SVD init (joint-v1): delta energy captured ..." from
+  the stage-5 scan, fit "already cached - skipping" (idempotent).
+- Regressions: test_dtype_mismatch, test_template_hy_v3 (ALL CHECKS
+  PASSED), test_lowram_fix 50/50, test_update9_router_guard 11/11,
+  test_update10_speed 11/11, py_compile OK.
+
+## For the user's r128 run
+One normal run on 10.8 rebuilds the stale SVD files (joint-aligned),
+re-fits from the init whose capture is now PRINTED, re-does the refine
+rounds and rebuilds the artifact. To also fix the pool (the run used the
+cached 36864 pairs/block instead of the requested 65536) and to counter
+the fit-plateau overfit:
+
+    python hf_pipeline.py <your usual args> --pool-recalibrate --io-cache disk
+
+(16 windows x 8 seq x 512 ctx = exactly 65536 pairs; the 16 GB box cannot
+keep the io-cache ram GGUF copy - the watchdog dropped it mid-run anyway.)
+Optional: --fit-jitter 0.05 (input-noise regularization), --refine-rounds 2
+(the worst blocks 18-21 are accumulation-limited, not fit-limited).

@@ -755,6 +755,24 @@ quietly stays fp32. Parameters remain fp32 either way (exact gradients);
 only the forward matmuls run in bf16 via oneDNN. Toy box: 1.7-1.8x per step.
 The decision is cached per geometry, so identical blocks do not re-probe.
 
+**Pool-aware fit cache (2026-09-05.6).** The fit signature now
+fingerprints the calibration pool (per-block pair counts) and the SVD-init
+version - `--pool-recalibrate` with a bigger `--per-layer-cap` now really
+re-fits (before, the new pool was silently ignored by the cached fit), and
+an upgraded init algorithm re-triggers the fit without manual deletions.
+
+**Joint SVD init (2026-09-05.6).** The field consumes DIAGONAL per-expert
+coordinates in a shared (U,V) basis; choosing U and V by two separate
+top-eigh problems leaves the diagonal only ~1/r of the delta energy
+(rank 128 -> ~1%: the fit started statistically blind even with the init
+files loaded - "step-0 mse == pure-centroid" in the guard). The builder now
+runs a cheap coordinate ascent on the stashed projected deltas that
+maximizes the diagonal objective itself (1.5-10x capture on synthetic
+blocks; expert weights are not re-read), stamps files `svd_ver`, and the
+fit log prints the init's step-0 capture so an uninformative init is
+visible: `SVD init (joint-v1): delta energy captured at step 0 - gu X%,
+dn Y%`.
+
 **SVD-init self-heal (2026-09-05.5).** The per-rank SVD init files
 (`fit_r{R}/init_svd_blk*.pt`) can go missing when the pool cache was built
 by an older package or a previous run silently fell back to the random init
