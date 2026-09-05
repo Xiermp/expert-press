@@ -1,3 +1,16 @@
+# version: 2026-09-05.5 - SVD-INIT SELF-HEAL: missing fit_dir/init_svd_blk*.pt
+#   (pool cache from a pre-SVD build, or an earlier run that fell back to the
+#   random init) are detected BEFORE the fit and rebuilt by a streaming pass
+#   from the real expert deltas - the optimizer never starts blind again. The
+#   stage-5 fallback is now a loud WARNING + report metadata, and refine
+#   rounds key their signature on the fit state (a re-fit invalidates stale
+#   refine caches: the captured pairs are the field's own forward outputs).
+# version: 2026-09-05.4 - REFINE RESUME + PARALLEL REFIT: a completed refine
+#   round is skipped on re-runs (done_r*.json markers in the run cache), a
+#   half-done round reuses the captured pairs (pairs_sig.json) instead of
+#   re-streaming the whole model for hours, and the refit loop now honors
+#   --fit-workers (before: always one worker). --refresh-refine forces a
+#   full redo.
 # version: 2026-09-05.2 - SWAP-STORM GUARD (refine freeze fix): the capture
 #   pass of the refine round kept per-block pair chunks of up to 8192 pairs in
 #   RAM for ALL blocks at once (~1.1 GB) while the io-cache ram copy was also
@@ -115,6 +128,7 @@ Windows: the same commands via double click - step1_compress.bat / step2_chat.ba
 """
 import argparse
 import gc
+import hashlib
 import importlib.util
 import json
 import os
@@ -832,8 +846,15 @@ def main():
     ap.add_argument("--refresh-init", action="store_true",
                     help="rebuild ONLY the per-rank SVD init files "
                          "(init_svd_blk*.pt) for an existing pool cache and "
-                         "exit - use once after updating from an older "
-                         "version, then re-run the fit")
+                         "exit - normally not needed: since 2026-09-05.5 the "
+                         "pipeline detects missing files and rebuilds them "
+                         "automatically before the fit; existing files are "
+                         "kept (delete fit_dir/init_svd_blk*.pt to force)")
+    ap.add_argument("--refresh-refine", action="store_true",
+                    help="ignore the refine round cache (done markers + "
+                         "captured pairs) and redo the refine rounds - use "
+                         "after changing fit settings or when the current "
+                         "fits must be re-taught from scratch")
     ap.add_argument("--fit-jitter", type=float, default=0.0,
                     help="Gaussian noise on fit inputs, per-dim std units "
                          "(variance reduction for a SMALL calibration pool: "
@@ -844,8 +865,9 @@ def main():
                     help="fit bundle: fast (~2.5x quicker) | balanced (default "
                          "quality/speed trade) | quality (slowest, lowest mse)")
     ap.add_argument("--fit-workers", type=int, default=1,
-                    help="parallel fit workers for independent blocks (2-4 on a "
-                         "multi-core CPU; 1 = sequential)")
+                    help="parallel fit workers for independent blocks, the "
+                         "refine refit uses them too (2-4 on a multi-core "
+                         "CPU; 1 = sequential)")
     ap.add_argument("--fit-early-stop", type=int, default=0,
                     help="stop each block's fit after 2 consecutive flat mse "
                          "checkpoints (every N steps, e.g. 50; 0 = off). Saves "
@@ -1174,6 +1196,28 @@ def main():
                        or not all(os.path.isfile(os.path.join(pool_dir,
                                                 f"init_blk{i}.pt"))
                                   for i in range(pool_cache))))
+    # 2026-09-05.5 SVD-init self-heal: the fit (default --fit-init svd)
+    # needs fit_dir/init_svd_blk*.pt; they are missing when the pool was
+    # built by a pre-SVD build or an earlier run silently fell back to
+    # the random init (its per-block resume then skipped the SVD part
+    # forever). Detect the gap HERE and force the streaming pass that
+    # rebuilds the files from the real expert deltas - the fit starts
+    # informed instead of blind, and a stale random-init fit is re-fitted
+    # automatically (its signature changes). Cost: one expert-weights
+    # read per block, no model forward.
+    svd_heal = False
+    if ("fit" in plan and args.fit_init == "svd" and not args.refresh_init
+            and pool_cache):
+        svd_heal = not all(os.path.isfile(os.path.join(
+            fit_dir, f"init_svd_blk{i}.pt")) for i in range(pool_cache))
+        if svd_heal:
+            print(f"SVD init check: init_svd_blk*.pt missing for rank "
+                  f"{args.rank} ({pool_cache} blocks) - a streaming pass "
+                  f"will build them from the expert weights (~minutes: one "
+                  f"expert read per block, no model forward). An existing "
+                  f"random-init fit for this rank is re-fitted afterwards.",
+                  flush=True)
+            calib_pass = True  # force the streaming pass (experts on disk)
     refresh_only = False
     if args.refresh_init:
         if not pairs_cache:
@@ -1212,6 +1256,17 @@ def main():
                if base_pass else
                "STAGE 4 prep - loading the source for calibration (base metrics "
                "are skipped: --skip base / cached)")
+        if calib_pass and not base_pass and full_cache:
+            # 2026-09-05.5 SVD-init heal pass: stage 3/base is fully
+            # cached - take the base metrics + eval tokens from the cache
+            # so the verify stage keeps its ppl delta (the model below is
+            # loaded for the expert weights only, no forward passes)
+            d = torch.load(os.path.join(pool_dir, "eval_tokens.pt"),
+                           map_location="cpu")
+            X, Y, eval_ids = d["X"], d["Y"], d["eval_ids"]
+            base_m = base_metrics_from_cache(lp_dir, X, Y)
+            print(f"BASE ({base_label()}) (from the log-prob cache): "
+                  f"ppl {base_m['ppl']:.2f}", flush=True)
         stream = None
         if quantized:
             model = load_source_model(args, src, dtype, device, quantized)
@@ -1361,7 +1416,9 @@ def main():
             def _save_svd_init(i, block, mgu, mdn):
                 basis = expert_basis_init(block, mgu, mdn, args.rank,
                                           log_prefix=f"block {i}/{len(blocks)}")
-                torch.save(basis, os.path.join(fit_dir, f"init_svd_blk{i}.pt"))
+                ftmp = os.path.join(fit_dir, f"init_svd_blk{i}.pt.tmp")
+                torch.save(basis, ftmp)   # atomic: no torn svd-init file
+                os.replace(ftmp, os.path.join(fit_dir, f"init_svd_blk{i}.pt"))
                 return 1
 
             svd_done = 0
@@ -1369,35 +1426,57 @@ def main():
             t_stage4 = time.time()
             for i, (_, block) in enumerate(blocks):
                 ipath = os.path.join(pool_dir, f"init_blk{i}.pt")
-                if not refresh_only and os.path.isfile(ipath):
+                spath = os.path.join(fit_dir, f"init_svd_blk{i}.pt")
+                svd_missing = (args.fit_init == "svd"
+                               and not os.path.isfile(spath))
+                if refresh_only and not svd_missing:
+                    # resumable --refresh-init: existing files are kept
+                    # (delete fit_dir/init_svd_blk*.pt to force a rebuild)
+                    print(f"  block {i}/{len(blocks)}: init_svd_blk{i}.pt "
+                          f"already exists - skipped", flush=True)
+                    continue
+                cached = (not refresh_only and os.path.isfile(ipath))
+                if cached and not svd_missing:
                     # resumable stage 4: this block's init survived the last
-                    # run - inits depend only on the model, never recompute
+                    # run (and its SVD init exists or is not wanted) - inits
+                    # depend only on the model, never recompute
                     inits_reused += 1
                     print(f"  block {i}/{len(blocks)}: init cached - skipped",
                           flush=True)
                     continue
                 t0 = time.time()
+                # 2026-09-05.5: a cached init_blk also feeds the SVD-init
+                # heal (its centroids are reusable) - no expert_means re-run
                 ini = (torch.load(ipath, map_location="cpu")
-                       if refresh_only else None)
-                print(f"  block {i}/{len(blocks)}: centroids + "
+                       if (refresh_only or cached) else None)
+                print(f"  block {i}/{len(blocks)}: "
+                      f"{'cached init + ' if cached else ''}"
                       f"{'SVD init' if args.fit_init == 'svd' else 'init'} "
                       f"(rank {args.rank})...", flush=True)
                 if stream:
                     with stream.with_block(i):
-                        if refresh_only:
+                        if ini is not None:      # cached centroids (heal)
                             mgu, mdn = ini["mgu"], ini["mdn"]
                         else:
                             mgu, mdn = expert_means(block)
-                        if args.fit_init == "svd":
+                        if svd_missing:
                             svd_done += _save_svd_init(i, block, mgu, mdn)
                 else:
-                    if refresh_only:
+                    if ini is not None:          # cached centroids (heal)
                         mgu, mdn = ini["mgu"], ini["mdn"]
                     else:
                         mgu, mdn = expert_means(block)  # without an fp32 expert stack
-                    if args.fit_init == "svd":
+                    if svd_missing:
                         svd_done += _save_svd_init(i, block, mgu, mdn)
                 if refresh_only:
+                    continue
+                if cached:
+                    # heal: the init file itself is complete - only the
+                    # SVD part was missing
+                    inits_reused += 1
+                    print(f"  block {i}/{len(blocks)}: init cached, SVD "
+                          f"init built in {time.time() - t0:.1f}s",
+                          flush=True)
                     continue
                 # hy_v3: selection bias + shared experts (backbone already in RAM)
                 eb = block_router_bias(block)
@@ -1413,8 +1492,12 @@ def main():
                       f"{time.time() - t0:.1f}s", flush=True)
             if refresh_only:
                 print(f"refresh-init done: {svd_done}/{len(blocks)} SVD init "
-                      f"files written to {fit_dir} - now re-run the fit "
-                      "(the old fits are invalidated automatically)", flush=True)
+                      f"files written to {fit_dir}"
+                      + ("" if svd_done == len(blocks) else
+                         " (the rest already exist)")
+                      + " - now re-run the fit "
+                        "(the old fits are invalidated automatically)",
+                      flush=True)
                 if stream:
                     stream.close()
                 release_model(model, device)
@@ -1455,17 +1538,22 @@ def main():
             pass
     else:
         banner(f"STAGE 5 - field fit r={args.rank} on pairs from disk "
-               f"({args.fit_method}, model NOT in RAM)")
+               f"({args.fit_method}, "
+               f"{T.get('fit_init_effective', args.fit_init)} init, "
+               f"model NOT in RAM)")
         os.makedirs(fit_dir, exist_ok=True)
         svd_files = [os.path.join(fit_dir, f"init_svd_blk{i}.pt")
                      for i in range(n_blocks)]
         svd_ready = (args.fit_init == "svd"
                      and all(os.path.isfile(f) for f in svd_files))
+        T["fit_init_effective"] = "svd" if svd_ready else "random"
         if args.fit_init == "svd" and not svd_ready:
-            print("NOTE: --fit-init svd but init_svd_blk*.pt are missing for "
-                  "this rank - falling back to the random init. Rebuild them: "
-                  "python hf_pipeline.py <your usual args> --refresh-init",
-                  flush=True)
+            print("WARNING: --fit-init svd but init_svd_blk*.pt are missing "
+                  "for this rank - fitting from the RANDOM init (~3x more "
+                  "steps for the same quality; UPDATE-10). Since 2026-09-05.5 "
+                  "the pipeline self-heals this before the fit - if you still "
+                  "see this WARNING, check the log above for a failed "
+                  "streaming pass.", flush=True)
         fit_sig = dict(fit_steps=args.fit_steps, fit_bs=args.fit_bs, fit_lr=args.fit_lr,
                        fit_method=args.fit_method, fit_jitter=args.fit_jitter,
                        fit_early_stop=args.fit_early_stop,
@@ -1660,10 +1748,79 @@ def main():
             refit_dir = os.path.join(pool_dir, f"refine_r{args.rank}")
             os.makedirs(refit_dir, exist_ok=True)
             import glob as _glob
+
+            def _fit_state_sha():
+                # 2026-09-05.5: refine caches depend on the fit they
+                # warm-start from - the captured pairs are the FIELD's own
+                # forward outputs and change with every re-fit.
+                # fit_meta.json is rewritten exactly when the fit (re)runs
+                # (refine itself never touches it), so its hash invalidates
+                # stale refine rounds after a re-fit.
+                p = os.path.join(fit_dir, "fit_meta.json")
+                try:
+                    with open(p, "rb") as f:
+                        return hashlib.sha1(f.read()).hexdigest()[:16]
+                except OSError:
+                    return "nofit"
             for rnd in range(1, args.refine_rounds + 1):
                 banner(f"STAGE 5b.{rnd} - refine round: the field feeds forward, "
                        f"the original experts teach")
                 try:
+                    # 2026-09-05.4: refine RESUME - the round is identified by
+                    # a signature of its settings; a completed round is
+                    # skipped, a half-done one reuses the captured pairs (the
+                    # capture is the expensive half: a full streaming pass).
+                    # --refresh-refine ignores both caches.
+                    rtag = dict(stamp="2026-09-05.5", rank=args.rank, rnd=rnd,
+                                fit_state=_fit_state_sha(),
+                                per_layer_cap=args.per_layer_cap,
+                                calib_ctx=args.calib_ctx,
+                                calib_bsz=args.calib_bsz,
+                                calib_windows=args.calib_windows,
+                                fit_steps=args.fit_steps, fit_bs=args.fit_bs,
+                                fit_lr=args.fit_lr,
+                                fit_method=args.fit_method,
+                                fit_jitter=args.fit_jitter,
+                                fit_early_stop=args.fit_early_stop,
+                                fit_guard_warmup=args.fit_guard_warmup,
+                                fit_lr_warmup=args.fit_lr_warmup,
+                                fit_router=args.fit_router,
+                                router_anchor=args.router_anchor,
+                                router_steps=args.router_steps,
+                                router_lr=router_lr,
+                                strict_fit_guard=args.strict_fit_guard,
+                                fit_autocast=args.fit_autocast,
+                                muon_max_dim=args.muon_max_dim,
+                                muon_ns_steps=args.muon_ns_steps)
+                    r_sig = hashlib.sha256(json.dumps(
+                        rtag, sort_keys=True, default=str).encode()).hexdigest()[:16]
+                    done_p = os.path.join(refit_dir, f"done_r{rnd}.json")
+                    if not args.refresh_refine and os.path.isfile(done_p):
+                        try:
+                            with open(done_p, encoding="utf-8") as f:
+                                dmk = json.load(f)
+                        except Exception:  # noqa: BLE001 - torn marker
+                            dmk = None
+                        if dmk and dmk.get("sig") == r_sig and dmk.get("mse"):
+                            fit_mses = [float(v) for v in dmk["mse"]]
+                            T["refine_rounds"] = max(
+                                int(T.get("refine_rounds") or 0), rnd)
+                            print(f"  refine round {rnd}: cached (resume) - "
+                                  f"skipped (--refresh-refine to force redo)",
+                                  flush=True)
+                            continue
+                    psig_p = os.path.join(refit_dir, "pairs_sig.json")
+                    reuse_pairs = False
+                    if not args.refresh_refine and os.path.isfile(psig_p):
+                        try:
+                            with open(psig_p, encoding="utf-8") as f:
+                                ps = json.load(f)
+                            reuse_pairs = bool(
+                                ps.get("sig") == r_sig and ps.get("files")
+                                and all(os.path.isfile(os.path.join(refit_dir, fn))
+                                        for fn in ps["files"]))
+                        except Exception:  # noqa: BLE001 - torn sig
+                            reuse_pairs = False
                     # 1) field modules from the current fits
                     field_mods = []
                     for i in range(n_blocks):
@@ -1680,94 +1837,112 @@ def main():
                         field_mods.append(fm.to(device).eval())
                     # 2) streaming pass: capture (input -> ORIGINAL output) pairs,
                     #    feed the FIELD output forward
-                    for f in _glob.glob(os.path.join(refit_dir, "pairs_blk*_p*.pt")):
-                        os.remove(f)
-                    runner2 = BlockStreamRunner(src, dtype=dtype, device=device,
-                                                gguf=light_gguf,
-                                                prefetch=args.prefetch,
-                                                io_workers=args.io_threads,
-                                                io_cache=args.io_cache)
-                    blocks2 = find_moe_blocks(runner2)
-                    stores = [[] for _ in range(n_blocks)]   # per-block list of (X,Y) chunk files
+                    if reuse_pairs:
+                        n_pf = len(_glob.glob(os.path.join(
+                            refit_dir, "pairs_blk*_p*.pt")))
+                        print(f"  refine pairs: {n_pf} chunk files reused "
+                              f"from the cache - capture skipped", flush=True)
+                    else:
+                        for f in _glob.glob(os.path.join(refit_dir, "pairs_blk*_p*.pt")):
+                            os.remove(f)
+                        runner2 = BlockStreamRunner(src, dtype=dtype, device=device,
+                                                    gguf=light_gguf,
+                                                    prefetch=args.prefetch,
+                                                    io_workers=args.io_threads,
+                                                    io_cache=args.io_cache)
+                        blocks2 = find_moe_blocks(runner2)
+                        stores = [[] for _ in range(n_blocks)]   # per-block list of (X,Y) chunk files
 
-                    chunk_X = [[] for _ in range(n_blocks)]
-                    chunk_Y = [[] for _ in range(n_blocks)]
-                    chunk_n = [0] * n_blocks
+                        chunk_X = [[] for _ in range(n_blocks)]
+                        chunk_Y = [[] for _ in range(n_blocks)]
+                        chunk_n = [0] * n_blocks
 
-                    def store_pair(i, x, y):
-                        chunk_X[i].append(x)
-                        chunk_Y[i].append(y)
-                        chunk_n[i] += x.shape[0]
+                        def store_pair(i, x, y):
+                            chunk_X[i].append(x)
+                            chunk_Y[i].append(y)
+                            chunk_n[i] += x.shape[0]
 
-                    chunk_flush_at = refine_flush_at(ram_gb(available=True))
-                    if chunk_flush_at != 8192:
-                        print(f"refine capture: flushing pair chunks at "
-                              f"{chunk_flush_at} pairs (low RAM - smaller "
-                              f"disk chunks, resident ~= one batch ~0.4 GB "
-                              f"instead of ~1.1 GB)", flush=True)
+                        chunk_flush_at = refine_flush_at(ram_gb(available=True))
+                        if chunk_flush_at != 8192:
+                            print(f"refine capture: flushing pair chunks at "
+                                  f"{chunk_flush_at} pairs (low RAM - smaller "
+                                  f"disk chunks, resident ~= one batch ~0.4 GB "
+                                  f"instead of ~1.1 GB)", flush=True)
 
-                    def flush_chunk(i, force=False):
-                        # flush a chunk once it is big enough (bounded RAM),
-                        # or whatever remains at the end of the pass
-                        if chunk_n[i] and (force or chunk_n[i] >= chunk_flush_at):
-                            p = os.path.join(refit_dir,
-                                             f"pairs_blk{i}_p{len(stores[i]):02d}.pt")
-                            save_pairs_block(chunk_X[i], chunk_Y[i], p)
-                            stores[i].append(p)
-                            chunk_X[i], chunk_Y[i], chunk_n[i] = [], [], 0
+                        def flush_chunk(i, force=False):
+                            # flush a chunk once it is big enough (bounded RAM),
+                            # or whatever remains at the end of the pass
+                            if chunk_n[i] and (force or chunk_n[i] >= chunk_flush_at):
+                                p = os.path.join(refit_dir,
+                                                 f"pairs_blk{i}_p{len(stores[i]):02d}.pt")
+                                save_pairs_block(chunk_X[i], chunk_Y[i], p)
+                                stores[i].append(p)
+                                chunk_X[i], chunk_Y[i], chunk_n[i] = [], [], 0
 
-                    hooks2 = []
-                    for i, (_, b) in enumerate(blocks2):
-                        def make_cap(i):
-                            def cap_hook(m, a, output):
-                                if chunk_n[i] < args.per_layer_cap:
-                                    x = a[0].detach()
-                                    y = output.detach() if torch.is_tensor(output) \
-                                        else output[0].detach()
-                                    store_pair(i,
-                                               x.reshape(-1, x.shape[-1]).to(torch.bfloat16).cpu(),
-                                               y.reshape(-1, y.shape[-1]).to(torch.bfloat16).cpu())
-                                with torch.no_grad():
-                                    # fit modules are fp32; the stream is bf16
-                                    fout = field_mods[i](a[0].float())
-                                fout = fout.to(a[0].dtype)
-                                if isinstance(output, tuple):
-                                    return (fout,) + tuple(output[1:])
-                                return fout
-                            return cap_hook
-                        hooks2.append(b.register_forward_hook(make_cap(i)))
-                    gen2 = torch.Generator().manual_seed(11 + rnd)
-                    batches2 = make_batches(calib_ids, args.calib_ctx, args.calib_bsz,
-                                            args.calib_windows, device, gen2)
-                    n_windows2 = len(batches2)
-                    for wi, batch in enumerate(batches2, 1):
-                        runner2(**batch)
+                        hooks2 = []
+                        for i, (_, b) in enumerate(blocks2):
+                            def make_cap(i):
+                                def cap_hook(m, a, output):
+                                    if chunk_n[i] < args.per_layer_cap:
+                                        x = a[0].detach()
+                                        y = output.detach() if torch.is_tensor(output) \
+                                            else output[0].detach()
+                                        store_pair(i,
+                                                   x.reshape(-1, x.shape[-1]).to(torch.bfloat16).cpu(),
+                                                   y.reshape(-1, y.shape[-1]).to(torch.bfloat16).cpu())
+                                    with torch.no_grad():
+                                        # fit modules are fp32; the stream is bf16
+                                        fout = field_mods[i](a[0].float())
+                                    fout = fout.to(a[0].dtype)
+                                    if isinstance(output, tuple):
+                                        return (fout,) + tuple(output[1:])
+                                    return fout
+                                return cap_hook
+                            hooks2.append(b.register_forward_hook(make_cap(i)))
+                        gen2 = torch.Generator().manual_seed(11 + rnd)
+                        batches2 = make_batches(calib_ids, args.calib_ctx, args.calib_bsz,
+                                                args.calib_windows, device, gen2)
+                        n_windows2 = len(batches2)
+                        for wi, batch in enumerate(batches2, 1):
+                            runner2(**batch)
+                            for i in range(n_blocks):
+                                flush_chunk(i)
+                            # 2026-09-05.2: per-window progress - in the wild this
+                            # pass froze silently (swap-storm); a moving line
+                            # makes "working" vs "stuck" distinguishable.
+                            print(f"\r    ... refine capture: window {wi}/"
+                                  f"{n_windows2}, pairs {min(chunk_n)}.."
+                                  f"{max(chunk_n)} of {args.per_layer_cap}".
+                                  ljust(100), end="", flush=True)
+                            if all(chunk_n[i] >= args.per_layer_cap for i in range(n_blocks)):
+                                break
+                        print()
+                        for h in hooks2:
+                            h.remove()
                         for i in range(n_blocks):
-                            flush_chunk(i)
-                        # 2026-09-05.2: per-window progress - in the wild this
-                        # pass froze silently (swap-storm); a moving line
-                        # makes "working" vs "stuck" distinguishable.
-                        print(f"\r    ... refine capture: window {wi}/"
-                              f"{n_windows2}, pairs {min(chunk_n)}.."
-                              f"{max(chunk_n)} of {args.per_layer_cap}".
-                              ljust(100), end="", flush=True)
-                        if all(chunk_n[i] >= args.per_layer_cap for i in range(n_blocks)):
-                            break
-                    print()
-                    for h in hooks2:
-                        h.remove()
-                    for i in range(n_blocks):
-                        flush_chunk(i, force=True)
-                    runner2.close()
-                    del runner2
-                    gc.collect()
-                    for i, paths in enumerate(stores):
-                        print(f"  block {i}: {len(paths)} chunks -> refine pairs",
-                              flush=True)
+                            flush_chunk(i, force=True)
+                        runner2.close()
+                        del runner2
+                        gc.collect()
+                        for i, paths in enumerate(stores):
+                            print(f"  block {i}: {len(paths)} chunks -> refine pairs",
+                                  flush=True)
+                        psig_files = sorted(
+                            os.path.basename(p) for p in _glob.glob(
+                                os.path.join(refit_dir, "pairs_blk*_p*.pt")))
+                        with open(psig_p + ".tmp", "w", encoding="utf-8") as f:
+                            json.dump({"sig": r_sig, "files": psig_files}, f)
+                        os.replace(psig_p + ".tmp", psig_p)
                     # 3) warm-started refit on the refine pairs
-                    ref_mses = []
+                    # 2026-09-05.4: blocks are independent - the refit runs
+                    # through the same worker pool as the stage-5a fit
+                    # (--fit-workers; before this it was always one worker)
+                    ref_mses = [None] * n_blocks
                     router_stats = {}
-                    for i in range(n_blocks):
+                    errors = []
+                    lk = threading.Lock()
+
+                    def refit_one(i):
                         Xs, Ys = [], []
                         for p in sorted(_glob.glob(os.path.join(
                                 refit_dir, f"pairs_blk{i}_p*.pt"))):
@@ -1830,7 +2005,46 @@ def main():
                                 / ini["gw"].float().norm().clamp_min(1e-12)))
                         del fit_mod, Xi, Yi
                         gc.collect()
-                        ref_mses.append(mse)
+                        return mse
+
+                    w = max(1, min(int(args.fit_workers), n_blocks or 1))
+                    if w > 1 and n_blocks > 1:
+                        if not args.threads:
+                            per = max(1, (os.cpu_count() or 2) // w)
+                            torch.set_num_threads(per)
+                            print(f"refine refit: {w} workers x {per} cpu "
+                                  f"threads (--fit-workers)", flush=True)
+                        work = queue.Queue()
+                        for i in range(n_blocks):
+                            work.put(i)
+
+                        def refit_worker():
+                            while True:
+                                try:
+                                    i = work.get_nowait()
+                                except queue.Empty:
+                                    return
+                                try:
+                                    mse = refit_one(i)
+                                    ref_mses[i] = mse
+                                except Exception as e:  # noqa: BLE001
+                                    with lk:
+                                        errors.append((i, e))
+
+                        ths = [threading.Thread(target=refit_worker,
+                                                name=f"refit-{k}",
+                                                daemon=True) for k in range(w)]
+                        for t in ths:
+                            t.start()
+                        for t in ths:
+                            t.join()
+                        if errors:
+                            i, e = errors[0]
+                            raise RuntimeError(
+                                f"refine refit failed on block {i}: {e}") from e
+                    else:
+                        for i in range(n_blocks):
+                            ref_mses[i] = refit_one(i)
                     fit_mses = ref_mses
                     with open(os.path.join(fit_dir, "mse.json"), "w",
                               encoding="utf-8") as f:
@@ -1839,6 +2053,9 @@ def main():
                         with open(os.path.join(fit_dir, "router_meta.json"),
                                   "w", encoding="utf-8") as f:
                             json.dump(router_stats, f)
+                    with open(done_p + ".tmp", "w", encoding="utf-8") as f:
+                        json.dump({"sig": r_sig, "mse": fit_mses}, f)
+                    os.replace(done_p + ".tmp", done_p)
                     print(f"refine round {rnd} done: fits updated "
                           f"(warm start from the previous round)", flush=True)
                     T["refine_rounds"] = rnd

@@ -95,9 +95,17 @@ python3 hf_pipeline.py --skip base,verify,report  # run all EXCEPT these
 python3 hf_pipeline.py --skip download            # reuse-only: never touch the network
 python3 hf_pipeline.py --stages fit --rank 64     # a new rank from the cached pool
 python3 hf_pipeline.py --stages refine --refine-rounds 1   # refine standalone
+python3 hf_pipeline.py --stages verify            # ONLY the loss check: KL/ppl/% from the caches
 python3 hf_pipeline.py --gen-tokens 0             # no demo generations
 python3 hf_pipeline.py --no-cache-verify          # skip the 2-chunk cache self-check
 ```
+
+Completed refine rounds are cached too (`done_r*.json` + `pairs_sig.json`
+in the run cache): a repeated run skips the hours-long capture pass and the
+refit entirely; `--refresh-refine` forces a full redo. The refine refit
+honors `--fit-workers` (2-4 on a multi-core CPU). The runtime artifact is
+dtype-robust: mixed-dtype checkpoints (fp32 backbone + bf16 field) and
+fp32-returning v5 routers no longer crash matmuls (10.6).
 
 Cheap missing stages (`download`, `texts`) are auto-added with a notice;
 expensive missing prerequisites (`base`, `calibrate`, `fit`, `verify`)
@@ -314,7 +322,7 @@ python3 hf_pipeline.py --fit-steps 800            # longer fit - a more precise 
 python3 hf_pipeline.py --low-mem --threads 4      # gentle mode
 python3 hf_pipeline.py --skip-reload-check        # skip the final reload check
 python3 hf_pipeline.py --smoke                    # quick wiring check
-python3 hf_pipeline.py --refresh-init             # rebuild the SVD init files for an existing pool, then exit
+python3 hf_pipeline.py --refresh-init             # manually rebuild the SVD init files (normally automatic since 2026-09-05.5)
 python3 hf_pipeline.py --fit-method muon-cosine   # Muon on the U/V factors
 python3 hf_pipeline.py --fit-autocast off         # force fp32 matmuls (the probe keeps fp32 automatically when bf16 is slower)
 ```
@@ -747,8 +755,16 @@ quietly stays fp32. Parameters remain fp32 either way (exact gradients);
 only the forward matmuls run in bf16 via oneDNN. Toy box: 1.7-1.8x per step.
 The decision is cached per geometry, so identical blocks do not re-probe.
 
-After updating from an older package run once:
-`python3 hf_pipeline.py <your usual args> --refresh-init`
-(it rebuilds the per-rank SVD init files for the existing pool cache and
-exits; the next fit picks them up - old fits are invalidated automatically
-via the fit signature). `--fit-init random` restores the old behavior.
+**SVD-init self-heal (2026-09-05.5).** The per-rank SVD init files
+(`fit_r{R}/init_svd_blk*.pt`) can go missing when the pool cache was built
+by an older package or a previous run silently fell back to the random init
+- the fit then started "blind" (~3x more steps for the same quality, and the
+blind fit was cached and reused forever). The pipeline now detects the gap
+before the fit and rebuilds the files in a short streaming pass (one expert
+read per block, no model forward - minutes on a 4.4 GB GGUF); an existing
+random-init fit is re-fitted automatically, and refine rounds are re-done on
+top of the new fit (their cached pairs depend on the field's own outputs).
+The report JSON carries `fit_init_effective` so a "random" fallback can no
+longer slip through unnoticed. `--refresh-init` still exists for a manual
+rebuild (idempotent, resumable); `--fit-init random` restores the old
+init on purpose.

@@ -296,3 +296,157 @@ the OLMoE toy only. It never grew the hy_v3 branches that the fit side
   are cached (fit_sig unchanged), Stage 6 rebuilds the artifact with the new
   template, Stage 7 verifies. Without `--refine-rounds 0` the refine round
   repeats (it has no skip marker - its pairs are deliberately rebuilt).
+
+----
+
+# 2026-09-05.4 - DTYPE-MISMATCH FIX + REFINE RESUME/PARALLEL REFIT: build 10.6
+
+Files changed: `modeling_field_template.py` + regenerated
+`modeling_field_HYV3_ready.py` (version stamp 2026-09-05.4),
+`hf_pipeline.py` (2026-09-05.4: refine resume + parallel refit),
+new `test_dtype_mismatch.py` (10 checks), README bullets.
+
+## Context
+User report: after installing 10.5, Stage 7 got past the router fix and
+crashed deeper: `RuntimeError: expected m1 and m2 to have the same dtype,
+but got: float != struct c10::BFloat16` at `cgu, cdn = z @ self.Cgu` in the
+artifact's `modeling_field.py`. Two independent causes:
+
+1. v5 routers upcast INSIDE: `HYV3TopKRouter` returns fp32 logits/weights
+   even in a bf16 model (probed on transformers 5.16.1: logits fp32, scores
+   fp32). The field built `z = zeros_like(logits)` -> fp32, while the field
+   params are bf16 in the artifact (94 MB = exactly bf16 for 47M params).
+   torch ADDITIONS type-promote, matmuls do not -> crash.
+2. A checkpoint loaded "as stored" (`dtype=None`) is MIXED: the backbone
+   comes from the GGUF dequant (fp32/fp16 tensors) while the field was saved
+   bf16 for size. Any external app loading without an explicit dtype would
+   hit the same wall - the runtime must be dtype-robust on its own.
+
+Same visit, two long-standing refine complaints:
+- a repeated run re-streamed the WHOLE model for the refine capture even
+  when the round had already completed (hours wasted after a Stage-7 crash);
+- the refine refit loop ignored `--fit-workers` (always one worker, unlike
+  the stage-5a fit).
+
+## What was done
+- `modeling_field_template.py`: new `_align_field_dtype` - on the first
+  forward every floating tensor of the field module (field params, router
+  bias buffer, shared_experts weights, gate) is aligned ONCE to the host's
+  compute dtype (`hidden_states.dtype`), memoized in `_field_dtype`;
+  `z` is cast to `x.dtype` after the scatter. Upcasts (bf16 field -> fp32
+  host) are bit-exact pure casts; downcasts only happen when the whole host
+  already runs in that dtype. No per-call temporaries, O(1) per forward.
+- `hf_pipeline.py` (refine stage 5b):
+  * each round is identified by a sha256 signature of its settings (rank,
+    caps, calib, fit params, router params, version stamp);
+  * a COMPLETED round is skipped on re-runs via `done_r{N}.json` markers
+    (mse list restored from the marker); a HALF-DONE round reuses the
+    captured pairs via `pairs_sig.json` (signature + chunk-file list) -
+    the capture pass (the expensive half) no longer re-runs;
+  * `--refresh-refine` forces a full redo (old behavior);
+  * the refit loop is now a worker pool with the same pattern as stage 5a:
+    `w = min(--fit-workers, n_blocks)`, thread split of CPU cores, errors
+    collected and re-raised after join (the per-round failure semantics
+    from 2026-09-05.2 are preserved).
+
+## Verification (toy stand FIRST, then package)
+- NEW `test_dtype_mismatch.py` (10 checks): probes the host router fp32
+  behavior; `from_pretrained(dtype=bfloat16)` on a mini hy_v3 artifact
+  (the exact Stage-7 path) survives; mixed checkpoint (backbone fp32 +
+  field bf16) runs in fp32 with bit-exact param casts and deterministic
+  repeats; bf16 host with an fp32 gate aligns down without a crash.
+- `test_template_hy_v3.py` 18/18, `test_lowram_fix.py` 42/42,
+  `test_update9_router_guard.py` 11/11, `test_update10_speed.py` 11/11.
+- Toy e2e on tiny.gguf (`--smoke --refine-rounds 1`): run 1 PIPELINE
+  FINISHED (KL -0.002 bits, +0.0%); run 2 skips the fit AND the refine
+  round ("cached (resume)") with identical metrics; run 3 with
+  `--refresh-refine --fit-workers 2` re-captures and refits through
+  "refine refit: 2 workers x 1 cpu threads"; `--stages verify` alone
+  prints BASE ppl (from the log-prob cache) + FIELD KL/ppl/% with no
+  model, fit or refine.
+
+----
+
+# 2026-09-05.5 - SVD-INIT SELF-HEAL + STALE-REFINE GUARD: build 10.7
+
+Files changed: `hf_pipeline.py` (2026-09-05.5). No template/runtime changes.
+
+## Context
+User report: "при прошлом запуске было falling back to the random init -
+ану SVD для 128 ранга не подтянулся. Оптимизатор начинал вслепую." Reproduced
+on the toy stand: the fit's SVD init (`init_svd_blk*.pt`, hole 1 from
+UPDATE-10) is RANK-SPECIFIC and lives in `fit_r{R}/`; when they are missing,
+stage 5 printed a small NOTE and fitted from the random init - which costs
+~3x more steps for the same quality (Bench E) and, at 23 MoE blocks x r128,
+is exactly the "optimizer starts blind" case. Two ways to get there:
+
+1. the pair pool was built by a PRE-SVD build (init_blk*.pt cached, no SVD
+   files): stage 4's per-block resume skipped everything forever;
+2. an earlier run of the CURRENT build hit the fallback once (e.g. after a
+   rank change done the wrong way): the blind fit was then CACHED in
+   fit_meta.json with `init: "random"` and silently reused by every re-run.
+
+Extra finding while reproducing: the refine-round cache (done_r*.json +
+pairs_sig.json, added in 10.6) did NOT depend on the fit state - after any
+re-fit the stale refine results were reused on top of the new fits (reproduced:
+"refine round 1: cached (resume) - skipped" right above a brand-new fit).
+
+## What was done (hf_pipeline.py)
+- SVD-INIT SELF-HEAL: before phase A, if a fit is planned with
+  `--fit-init svd` (the default) and `init_svd_blk*.pt` are missing for this
+  rank while the pool cache exists, the pipeline says so ("SVD init check:
+  ... missing for rank R (N blocks) ...") and forces the streaming pass that
+  rebuilds them from the REAL expert deltas. Cost: one expert-weights read
+  per block, NO model forward (centroids mgu/mdn come from the cached
+  init_blk*.pt - no expert_means re-run). The stale random-init fit is
+  re-fitted automatically (its signature changes from `random` to `svd`).
+- stage-4 loop: the per-block resume now distinguishes "init cached, SVD
+  missing" (heal: reuse cached centroids + build the SVD part) from the
+  fully-cached skip; `init_svd_blk*.pt` are written ATOMICALLY (.tmp +
+  os.replace - no torn files after a kill); blocks whose SVD file already
+  exists are skipped -> an interrupted heal/refresh resumes per block.
+- `--refresh-init` keeps the same skip-existing semantics (idempotent,
+  resumable; delete fit_dir/init_svd_blk*.pt to force a full rebuild) and
+  its help now says the heal is automatic.
+- stage-5 fallback: the NOTE became a loud WARNING with the consequence
+  spelled out (~3x more steps; UPDATE-10), the report JSON gains
+  `fit_init_effective` ("svd"/"random"), and the STAGE-5 banner shows the
+  effective init.
+- STALE-REFINE GUARD: each refine round's signature now includes
+  `fit_state` - the sha1 of `fit_meta.json`, which is rewritten exactly
+  when the fit (re)runs and is never touched by refine itself. A re-fit
+  therefore invalidates the refine rounds (the captured pairs are the
+  FIELD's own forward outputs - they MUST be re-captured); a fully-cached
+  re-run recomputes the same hash and keeps skipping as before.
+- Base-metrics preservation: a heal pass runs with the base stage cached
+  (no re-run of stage 3); the base ppl + eval tokens are loaded from the
+  log-prob cache so the verify stage keeps its ppl delta.
+
+## Verification (toy stand)
+- Reproduced the user's failure on 10.6 first: deleted fit_r32, re-ran ->
+  "NOTE ... falling back to the random init", fit_meta.json `init: "random"`,
+  stale refine reused. On 10.7: "SVD init check" -> "cached init + SVD init"
+  per block -> fit re-runs with `(adam, svd init, ...)` -> refine round
+  RE-DONE (stale guard works) -> `fit_meta.json init: "svd"` -> verify green.
+- Re-run after the heal: no SVD-init check, no streaming pass, fit and
+  refine both "cached - skipped", identical metrics (idempotent).
+- Fresh rank on an existing pool (`--rank 16`): heal builds fit_r16/
+  init_svd_blk*.pt from the cached centroids, fit uses svd, verify green.
+- `--refresh-init` with all files present: per-block "already exists -
+  skipped", 0/N written, no wasteful re-streaming.
+- `--stages verify`: NO heal, no streaming pass (fit not planned).
+- Regressions: test_dtype_mismatch, test_template_hy_v3 (ALL CHECKS
+  PASSED), test_lowram_fix 50/50, test_update9_router_guard 11/11,
+  test_update10_speed 11/11, py_compile OK.
+
+## For the user's r128 run
+The existing r128 artifact was fitted blind (random init) - the fit AND the
+refine rounds are tainted. One command fixes the state on 10.7:
+
+    python hf_pipeline.py <your usual args>
+
+The pipeline will: rebuild init_svd_blk*.pt for r128 (~minutes, one expert
+read per block), re-fit all blocks from the SVD init (the expensive part,
+unavoidable - the blind fit must be re-taught), redo the refine rounds on
+top, rebuild the artifact and verify. If you only want to check losses
+without re-fitting: `--stages verify` still works off the existing caches.
