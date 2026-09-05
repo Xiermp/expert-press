@@ -1,0 +1,62 @@
+[
+  {
+    "name": "bug",
+    "color": "d73a4a",
+    "description": "Something isn't working"
+  },
+  {
+    "name": "enhancement",
+    "color": "a2eeef",
+    "description": "New feature or request"
+  },
+  {
+    "name": "documentation",
+    "color": "0075ca",
+    "description": "Improvements or additions to documentation"
+  },
+  {
+    "name": "MOE-architecture",
+    "color": "ff6b6b",
+    "description": "Related to Mixture of Experts architecture"
+  },
+  {
+    "name": "VRAM-optimization",
+    "color": "ffd93d",
+    "description": "GPU memory (VRAM) optimization and compression"
+  },
+  {
+    "name": "memory-compression",
+    "color": "6bcf7f",
+    "description": "Memory compression techniques and strategies"
+  },
+  {
+    "name": "latent-field",
+    "color": "c44569",
+    "description": "Continuous latent field mapping approach"
+  },
+  {
+    "name": "performance",
+    "color": "fbca04",
+    "description": "Performance improvements and benchmarks"
+  },
+  {
+    "name": "LLM",
+    "color": "762694",
+    "description": "Large Language Model related"
+  },
+  {
+    "name": "help-wanted",
+    "color": "008672",
+    "description": "Extra attention is needed"
+  },
+  {
+    "name": "good-first-issue",
+    "color": "7057ff",
+    "description": "Good for newcomers"
+  },
+  {
+    "name": "question",
+    "color": "d876e3",
+    "description": "Further information is requested"
+  }
+]
